@@ -139,7 +139,14 @@ function resolveProvider(cfg) {
 }
 
 async function activeTab() {
-  const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (t && /^chrome-extension:/.test(t.url || "")) {
+    // popup abierto como pestaña: usar la pestaña de NetAcad más reciente
+    const all = await chrome.tabs.query({ currentWindow: true });
+    t = all
+      .filter((x) => /netacad\.(com|net)/.test(x.url || ""))
+      .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+  }
   if (!t) throw new Error("No hay pestaña activa.");
   if (!/netacad\.(com|net)|cisco\.com/.test(t.url || ""))
     throw new Error("Abre la lección de NetAcad en esta pestaña.");
@@ -915,6 +922,24 @@ function ccnaProbe() {
 }
 
 function ccnaScan(learnedPatterns = []) {
+  // El frame contenedor de NetAcad (con el menú lateral) nunca contiene el quiz
+  if (document.querySelector('iframe[title="Course content"]')) {
+    return {
+      url: location.href,
+      questions: [],
+      progress: null,
+      onConfirmScreen: false,
+      isResultScreen: false,
+      unansweredChips: [],
+      hasQuiz: false,
+      hasStart: false,
+      hasSubmit: false,
+      submitEnabled: false,
+      hasConfirm: false,
+      signature: "",
+      descartes: [],
+    };
+  }
   const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
   const deepAll = (sel, root = document) => {
     const out = [...root.querySelectorAll(sel)];
@@ -1625,7 +1650,7 @@ function ccnaScan(learnedPatterns = []) {
   };
 
   const allButtons = deepAll(
-    'button, a, [role="button"], input[type=submit], [class*="submit"]',
+    'button, a, [role="button"], input[type=submit], [class*="submit"], .start-button',
   ).filter((e) => !isCookie(e) && !isHiddenSlide(e, true));
 
   const enabledButtons = allButtons.filter((e) => {
@@ -2682,7 +2707,7 @@ function ccnaNav(kind, arg) {
       });
 
   if (kind === "start") {
-    const b = deepAll('button,a,[role="button"]')
+    const b = deepAll('button,a,[role="button"],.start-button')
       .filter(ok)
       .find((el) =>
         /comenzar|iniciar|\bstart\b/i.test(
@@ -2748,6 +2773,16 @@ function ccnaNav(kind, arg) {
     }
     return false;
   }
+  if (kind === "moduleNext") {
+    const b = document.querySelector(
+      'button[class*="moduleNavBtn"][class*="next"]',
+    );
+    if (b && ok(b)) {
+      b.click();
+      return true;
+    }
+    return false;
+  }
   if (kind === "next") {
     const b = deepAll('button,a,[role="button"]')
       .filter(ok)
@@ -2763,6 +2798,56 @@ function ccnaNav(kind, arg) {
     }
     return false;
   }
+  if (kind === "outlineNext") {
+    // Avanza por el esquema del curso (solo existe en el frame superior), en orden del DOM
+    const items = () => [...document.querySelectorAll('[role="treeitem"]')];
+    const isLeaf = (el) => /blockContainer/.test(el.className || "");
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    return (async () => {
+      // El esquema se vuelve a pintar tras enviar un quiz: se reintenta hasta hallar la página activa
+      let list = [];
+      let cur = -1;
+      const num = (arg || "").match(/^\d+(?:\.\d+)+/)?.[0];
+      for (let t = 0; t < 10 && cur === -1; t++) {
+        list = items();
+        // primero por número de página (más fiable), luego por la clase "active"
+        if (num)
+          cur = list.findIndex(
+            (el) =>
+              isLeaf(el) && new RegExp("^" + num.replace(/\./g, "\\.") + "(?![\\d.])").test(norm(el.innerText)),
+          );
+        if (cur === -1)
+          cur = list.findIndex(
+            (el) => isLeaf(el) && /active/.test(el.className || ""),
+          );
+        if (cur === -1) await wait(400);
+      }
+      if (cur === -1) return false;
+      for (let i = cur + 1; i < list.length; i++) {
+        const el = list[i];
+        if (isLeaf(el)) {
+          el.click();
+          return true;
+        }
+        if (el.getAttribute("aria-expanded") === "false") {
+          el.click();
+          await wait(800);
+          const after = items();
+          // los elementos nuevos se insertan después de este, así que su índice no cambia
+          const idx = after.includes(el) ? after.indexOf(el) : i;
+          const first = after[idx + 1];
+          if (first && isLeaf(first)) {
+            first.click();
+            return true;
+          }
+          // sin hojas visibles (p. ej. módulo recién abierto): seguir con los sub-encabezados
+          list = after;
+          i = idx;
+        }
+      }
+      return false;
+    })();
+  }
   if (kind === "sidebarNext") {
     const root = outlineRoot();
     if (!root) return false;
@@ -2776,7 +2861,8 @@ function ccnaNav(kind, arg) {
     const cur = links.findIndex(
       (el) =>
         el.matches('[aria-current="page"],[aria-selected="true"]') ||
-        /active|selected/i.test(el.className || ""),
+        (/blockContainer/.test(el.className || "") &&
+          /active/i.test(el.className || "")),
     );
     if (cur === -1 || !links[cur + 1]) return false;
     const target = links[cur + 1];
@@ -2937,12 +3023,26 @@ async function navIn(tabId, frameId, kind, arg) {
   const args = arg === undefined ? [kind] : [kind, arg];
   return (await execIn(tabId, frameId, ccnaNav, args)) === true;
 }
-async function advance(tabId, before) {
-  if (await nav(tabId, "next")) return true;
-  if (await nav(tabId, "sidebarNext")) return true;
-  if (await nav(tabId, "expandModule")) {
+async function advance(tabId, before, title = "") {
+  // 1) Flecha nativa de NetAcad ("Ir a <siguiente submódulo / examen>"): cruza módulos sin perderse
+  const modNext = await execIn(tabId, 0, ccnaNav, ["moduleNext"]);
+  if (modNext === true) {
+    await waitChange(tabId, before);
+    await sleep(700);
+    return true;
+  }
+  // 2) Botón genérico Siguiente/Next
+  if (await nav(tabId, "next")) {
+    await waitChange(tabId, before);
     await sleep(600);
-    if (await nav(tabId, "sidebarNext")) return true;
+    return true;
+  }
+  // 3) Avance hacia adelante en el esquema lateral (nunca retrocede al módulo 1)
+  const top = await execIn(tabId, 0, ccnaNav, ["outlineNext", title]);
+  if (top === true) {
+    await waitChange(tabId, before);
+    await sleep(700);
+    return true;
   }
   return waitChange(tabId, before);
 }
@@ -3324,7 +3424,10 @@ async function runWalk() {
     await setState({ page: title, label: "Recorriendo" });
     await log(`· ${title}`);
 
-    if (PT_RE.test(title) || PT_RE.test(info.docTitles))
+    if (
+      PT_RE.test(title) ||
+      (PT_RE.test(info.docTitles) && !QUIZ_RE.test(title))
+    )
       await log("  Packet Tracer: saltado");
     else if (!saved.has(title)) {
       saved.add(title);
@@ -3350,7 +3453,7 @@ async function runWalk() {
       await chrome.storage.local.set({ [IDX]: index });
     } else await log("  ya guardada");
 
-    if (!(await advance(tab.id, info.sig))) {
+    if (!(await advance(tab.id, info.sig, title))) {
       stop("No se pudo avanzar.");
       return;
     }
@@ -3384,7 +3487,16 @@ async function finishConfirmation(tabId, frameId) {
   return { ok: true, puntaje: "" };
 }
 
-async function runQuizzes() {
+async function outlineStatus(tabId, title = "") {
+  const r = await execAll(
+    tabId,
+    (t) => window.__ccna?.outlineStatus?.(t) || null,
+    [title],
+  );
+  return r.map((x) => x.result).find(Boolean) || null;
+}
+
+async function runQuizzes(single = false) {
   const patterns = await getLearnedPatterns();
   await log(
     `versión: quizzes-envio-v67 (patrones aprendidos: ${patterns.length})`,
@@ -3395,6 +3507,7 @@ async function runQuizzes() {
   const answers = [];
   const hechos = new Set();
   const intentosQuiz = new Map();
+  const repetirTitulo = new Set(); // quizzes que reintentamos nosotros mismos
   let visited = 0;
 
   for (let n = 0; n < cfg.maxPages && !abort; n++) {
@@ -3418,15 +3531,26 @@ async function runQuizzes() {
     const title = info.title || `Página ${n + 1}`;
     await setState({ page: title });
 
-    const isPT = PT_RE.test(title) || PT_RE.test(info.docTitles);
+    const isPT =
+      PT_RE.test(title) && !QUIZ_RE.test(title) && !QUIZ_RE.test(info.docTitles);
     let scan = { questions: [], hasQuiz: false, frameId: null, signature: "" };
     let repetir = false;
+    let yaCompletado = false;
 
     if (isPT) {
       await log(`· ${title}: Packet Tracer, saltado`);
     } else {
       scan = await scanTab(tab.id);
-      if (scan.hasStart) {
+      const maybeQuiz =
+        QUIZ_RE.test(title) ||
+        QUIZ_RE.test(info.docTitles) ||
+        scan.hasQuiz ||
+        scan.hasStart;
+      if (maybeQuiz) {
+        const os = await outlineStatus(tab.id, title);
+        yaCompletado = os?.status === "completed";
+      }
+      if (scan.hasStart && (!yaCompletado || repetirTitulo.has(title))) {
         await setState({ label: "Comenzando" });
         await nav(tab.id, "start");
         for (let i = 0; i < 18 && !scan.questions.length && !abort; i++) {
@@ -3438,10 +3562,19 @@ async function runQuizzes() {
 
     const isQuiz =
       !isPT &&
-      (QUIZ_RE.test(title) || QUIZ_RE.test(info.docTitles) || scan.hasQuiz);
+      (QUIZ_RE.test(title) ||
+        QUIZ_RE.test(info.docTitles) ||
+        scan.hasQuiz ||
+        scan.hasStart);
     const quizKey = `${title}::${scan.signature || info.sig.slice(0, 120)}`;
 
-    if (isQuiz && hechos.has(quizKey)) {
+    if (isQuiz && yaCompletado && !repetirTitulo.has(title)) {
+      await log(`· ${title}: ya completado, omitido`);
+      if (single) {
+        stop("Este quiz ya está completado.");
+        return;
+      }
+    } else if (isQuiz && hechos.has(quizKey)) {
       await log(`· ${title}: ya hecho`);
     } else if (isQuiz && scan.frameId !== null) {
       await log(`· ${title}`);
@@ -3839,6 +3972,7 @@ async function runQuizzes() {
                 `  reintento ${n + 1} de 4: completando ${omitidas > 0 ? `${omitidas} omitidas` : "incorrectas"}`,
               );
               hechos.delete(quizKey);
+              repetirTitulo.add(title);
               repetir = true;
             } else {
               await sleep(220);
@@ -3874,7 +4008,18 @@ async function runQuizzes() {
       continue;
     }
 
-    let movido = await advance(tab.id, info.sig);
+    if (single) {
+      await guardarRespuestas(answers);
+      stop(
+        visited
+          ? "Quiz terminado."
+          : "No encontré un quiz en esta página.",
+        !visited,
+      );
+      return;
+    }
+
+    let movido = await advance(tab.id, info.sig, title);
     if (!movido) {
       await guardarRespuestas(answers);
       stop(
@@ -4578,11 +4723,12 @@ chrome.runtime.onMessage.addListener((msg, _s, send) => {
   (async () => {
     try {
       const cfg = await getCfg();
-      if (!["notes", "diag", "quizzes"].includes(msg.mode) && !cfg.apiKey)
+      if (!["notes", "diag", "quizzes", "quizone"].includes(msg.mode) && !cfg.apiKey)
         throw new Error("Falta la API key.");
 
       if (msg.mode === "notes") await runWalk();
       else if (msg.mode === "quizzes") await runQuizzes();
+      else if (msg.mode === "quizone") await runQuizzes(true);
       else if (msg.mode === "explain") await runExplain();
       else if (msg.mode === "diag") {
         const tab = await activeTab();

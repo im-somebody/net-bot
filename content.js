@@ -292,6 +292,103 @@
       );
       return norm(h?.innerText).slice(0, 160);
     },
+    // Estado del quiz/submódulo actual en el esquema del curso (solo existe en el frame superior)
+    outlineStatus(hintTitle = "") {
+      const items = [...document.querySelectorAll('[role="treeitem"]')];
+      if (!items.length) return null;
+      const QUIZ_RE =
+        /verifique su comprensi[oó]n|compruebe su comprensi[oó]n|check your understanding|quiz del m[oó]dulo|module quiz|examen|exam|prueba de mi conocimiento|checkpoint|punto de control|midterm|final|pre-?certificaci[oó]n|assessment/i;
+      const isDone = (el) =>
+        [...el.querySelectorAll("img[alt]")].some((i) =>
+          /complet/i.test(i.getAttribute("alt") || ""),
+        );
+
+      // 1) Si el elemento activo en el esquema ES el propio quiz, usar su estado directo
+      const act = items.find(
+        (el) =>
+          /blockContainer/.test(el.className || "") &&
+          /active/.test(el.className || ""),
+      );
+      if (act && QUIZ_RE.test(norm(act.innerText))) {
+        return {
+          status: isDone(act) ? "completed" : "in-progress",
+          title: norm(act.innerText).slice(0, 160),
+        };
+      }
+
+      // 2) Identificar el submódulo actual (p. ej. "12.6.") a partir del título o del bloque activo
+      const subMatch =
+        norm(hintTitle).match(/\b(\d+\.\d+)\b/) ||
+        norm(document.title).match(/\b(\d+\.\d+)\b/) ||
+        (act && norm(act.innerText).match(/^(\d+\.\d+)\b/));
+      if (subMatch) {
+        const subNum = subMatch[1];
+        const subRe = new RegExp(
+          "^" + subNum.replace(/\./g, "\\.") + "(?:\\.|\\s|$)",
+        );
+        const subBtn = items.find(
+          (el) =>
+            /subModuleBtn/.test(el.className || "") &&
+            subRe.test(norm(el.innerText)),
+        );
+        if (subBtn && isDone(subBtn)) {
+          return {
+            status: "completed",
+            title: norm(subBtn.innerText).slice(0, 160),
+          };
+        }
+        const quizBlocks = items.filter(
+          (el) =>
+            /blockContainer/.test(el.className || "") &&
+            subRe.test(norm(el.innerText)) &&
+            QUIZ_RE.test(norm(el.innerText)),
+        );
+        if (quizBlocks.length) {
+          const allDone = quizBlocks.every(isDone);
+          return {
+            status: allDone ? "completed" : "in-progress",
+            title: norm(quizBlocks[0].innerText).slice(0, 160),
+          };
+        }
+        if (subBtn) {
+          return {
+            status: "in-progress",
+            title: norm(subBtn.innerText).slice(0, 160),
+          };
+        }
+      }
+
+      // 3) Exámenes independientes (Checkpoint Exam, Final Exam, etc.)
+      // Usar el nodo expandido/activo o el título específico completo (evitar coincidir con "Checkpoint Exam" genérico)
+      const activeNode = items.find(
+        (el) =>
+          /nodeInfoContainer/.test(el.className || "") &&
+          (el.getAttribute("aria-expanded") === "true" ||
+            /active/.test(el.className || "")) &&
+          QUIZ_RE.test(norm(el.innerText)),
+      );
+      const rawName = norm(hintTitle.split("|")[0] || "").toLowerCase();
+      const specificName =
+        rawName.length > 20 && !/^checkpoint exam$/i.test(rawName)
+          ? rawName
+          : "";
+      const node =
+        activeNode ||
+        (specificName
+          ? items.find(
+              (el) =>
+                /nodeInfoContainer/.test(el.className || "") &&
+                norm(el.innerText).toLowerCase().includes(specificName),
+            )
+          : null);
+      if (node) {
+        const txt = norm(node.innerText);
+        const done = isDone(node) || /\b(?:[789]\d|100)%/.test(txt);
+        return { status: done ? "completed" : "in-progress", title: txt.slice(0, 160) };
+      }
+
+      return null;
+    },
     sessionLost() {
       return /vuelva a iniciar el curso|restart the course|sesión expirada|session expired/i.test(
         deepText(),
