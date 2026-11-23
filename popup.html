@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --fg: #14171c;
+        --mut: #5c6470;
+        --card: #fff;
+        --bd: #d8dce3;
+        --pri: #1f6feb;
+        --pri-fg: #fff;
+        --ok: #1a7f37;
+        --warn: #9a6700;
+        --err: #b42318;
+      }
+      html[data-theme="dark"] {
+        --bg: #14171c;
+        --fg: #e9edf2;
+        --mut: #9aa4b2;
+        --card: #1c2027;
+        --bd: #2c323b;
+        --pri: #3b82f6;
+        --pri-fg: #0b1220;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --err: #f85149;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        width: 340px;
+        margin: 0;
+        padding: 12px;
+        background: var(--bg);
+        color: var(--fg);
+        font:
+          13px/1.45 system-ui,
+          -apple-system,
+          Segoe UI,
+          Roboto,
+          sans-serif;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      h2 {
+        font-size: 12px;
+        margin: 0 0 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        color: var(--mut);
+      }
+      .sub {
+        margin: 0 0 10px;
+        color: var(--mut);
+        font-size: 11.5px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--bd);
+        border-radius: 10px;
+        padding: 10px;
+        margin-bottom: 10px;
+      }
+      button {
+        width: 100%;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--bd);
+        background: transparent;
+        color: var(--fg);
+        font: inherit;
+        cursor: pointer;
+        text-align: left;
+      }
+      button:hover:not(:disabled) {
+        border-color: var(--pri);
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      button.primary {
+        background: var(--pri);
+        border-color: var(--pri);
+        color: var(--pri-fg);
+        font-weight: 600;
+      }
+      #theme {
+        width: auto;
+        padding: 2px 8px;
+      }
+      .desc {
+        margin: 5px 0 10px;
+        font-size: 11.5px;
+        color: var(--mut);
+      }
+      .desc:last-child {
+        margin-bottom: 0;
+      }
+      label {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 12px;
+        color: var(--mut);
+      }
+      input,
+      select {
+        width: 100%;
+        margin-top: 3px;
+        padding: 6px 8px;
+        border: 1px solid var(--bd);
+        border-radius: 7px;
+        background: var(--bg);
+        color: var(--fg);
+        font: inherit;
+      }
+      .check {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+        color: var(--fg);
+        font-size: 12px;
+      }
+      .check input {
+        width: auto;
+        margin: 0;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .row input {
+        margin-top: 0;
+      }
+      #eye {
+        width: auto;
+        padding: 4px 8px;
+      }
+      .tag {
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 20px;
+        border: 1px solid var(--bd);
+        color: var(--mut);
+      }
+      .tag.warn {
+        color: var(--warn);
+        border-color: var(--warn);
+      }
+      .srow {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+      }
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--mut);
+      }
+      .dot.live {
+        background: var(--ok);
+        animation: p 1.1s infinite;
+      }
+      .dot.err {
+        background: var(--err);
+      }
+      @keyframes p {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.3;
+        }
+      }
+      .meta {
+        font-size: 11.5px;
+        color: var(--mut);
+        word-break: break-word;
+      }
+      #keyState {
+        font-size: 11.5px;
+        margin: 6px 0 0;
+        color: var(--mut);
+      }
+      #keyState.ok {
+        color: var(--ok);
+      }
+      #keyState.bad {
+        color: var(--err);
+      }
+      #log {
+        margin: 0;
+        max-height: 120px;
+        overflow: auto;
+        font:
+          11px/1.4 ui-monospace,
+          monospace;
+        color: var(--mut);
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1><img src="icons/icon32.png" alt="" width="20" height="20" />Net-Bot</h1>
+      <button id="theme">◐</button>
+    </header>
+    <p class="sub">
+      Abre la lección en NetAcad y recarga con F5 antes de usar los botones.
+    </p>
+
+    <section class="card">
+      <div class="srow">
+        <span class="dot" id="dot"></span
+        ><strong id="stateText">Detenido</strong>
+      </div>
+      <div class="meta" id="pageText">—</div>
+      <div class="meta" id="reason"></div>
+    </section>
+
+    <section class="card">
+      <h2>Ajustes</h2>
+      <label
+        >Páginas máx.<input id="maxPages" type="number" min="1" value="1000"
+      /></label>
+      <label
+        >Espera (ms)<input
+          id="waitMs"
+          type="number"
+          min="500"
+          step="500"
+          value="3000"
+      /></label>
+      <label
+        >Proveedor
+        <select id="provider">
+          <option value="auto">Automático</option>
+          <option value="venice">Venice</option>
+          <option value="gemini">Gemini</option>
+          <option value="claude">Claude</option>
+        </select>
+      </label>
+      <label
+        >API key
+        <span class="row"
+          ><input id="apiKey" type="password" autocomplete="off" /><button
+            id="eye"
+          >
+            ver
+          </button></span
+        >
+      </label>
+      <button data-act="testkey" id="testkey">Probar la key</button>
+      <p id="keyState"></p>
+      <label class="check"
+        ><input id="useAI" type="checkbox" /> Resumir con IA
+        <span class="tag warn">gasta tokens</span></label
+      >
+    </section>
+
+    <section class="card">
+      <h2>Apuntes</h2>
+      <button class="primary" data-act="notes">
+        Recorrer curso y guardar apuntes
+      </button>
+      <p class="desc">Guarda un .md por página. Salta exámenes.</p>
+      <button data-act="quizzes">Recorrer quizzes, responder y enviar</button>
+      <p class="desc">
+        Marca la opción de la IA, confirma el envío y guarda el resultado.
+        Requiere key.
+      </p>
+      <button data-act="explain">Explicar esta página</button>
+      <p class="desc">Solo la página actual, sin avanzar. Requiere key.</p>
+    </section>
+
+    <section class="card">
+      <h2>Registro</h2>
+      <button data-act="diag">Diagnóstico de la página</button>
+      <p class="desc">Lista frames y detecta si falta el content script.</p>
+      <pre id="log"></pre>
+    </section>
+
+    <button data-act="stop" id="stop">Detener</button>
+    <script src="popup.js"></script>
+  </body>
+</html>

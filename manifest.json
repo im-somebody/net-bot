@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Net-Bot",
+  "version": "3.3",
+  "description": "Recorre el curso de NetAcad por ti, prepara tus apuntes de cada página y resuelve los exámenes.",
+  "permissions": ["activeTab", "scripting", "downloads", "storage", "tabs"],
+  "host_permissions": [
+    "https://*.netacad.com/*",
+    "https://*.netacad.net/*",
+    "https://*.cisco.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.anthropic.com/*",
+    "https://api.venice.ai/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html", "default_title": "Net-Bot",
+    "default_icon": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.netacad.com/*",
+        "https://*.netacad.net/*",
+        "https://*.cisco.com/*"
+      ],
+      "js": ["content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
+}

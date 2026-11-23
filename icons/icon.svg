@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#0b1220"/>
+  <!-- barras del logo Cisco/NetAcad como cresta -->
+  <g fill="#049fd9">
+    <rect x="22"  y="30" width="7" height="10" rx="3.5"/>
+    <rect x="32"  y="22" width="7" height="18" rx="3.5"/>
+    <rect x="42"  y="12" width="7" height="28" rx="3.5"/>
+    <rect x="52"  y="22" width="7" height="18" rx="3.5"/>
+    <rect x="62"  y="30" width="7" height="10" rx="3.5"/>
+    <rect x="72"  y="22" width="7" height="18" rx="3.5"/>
+    <rect x="82"  y="12" width="7" height="28" rx="3.5"/>
+    <rect x="92"  y="22" width="7" height="18" rx="3.5"/>
+    <rect x="102" y="30" width="7" height="10" rx="3.5"/>
+  </g>
+  <!-- calavera -->
+  <path fill="#e9edf2" d="M65 42c-21 0-34 13-34 30 0 11 5 18 12 22v9c0 3 2 5 5 5h34c3 0 5-2 5-5v-9c7-4 12-11 12-22 0-17-13-30-34-30z"/>
+  <circle cx="52" cy="72" r="9" fill="#0b1220"/>
+  <circle cx="78" cy="72" r="9" fill="#0b1220"/>
+  <path fill="#0b1220" d="M65 83l-5 8h10z"/>
+  <g fill="#0b1220">
+    <rect x="51" y="97" width="6" height="8" rx="1"/>
+    <rect x="62" y="97" width="6" height="8" rx="1"/>
+    <rect x="73" y="97" width="6" height="8" rx="1"/>
+  </g>
+</svg>
