@@ -2,6 +2,8 @@
 
 Extensión de Chrome para NetAcad que recorre el curso por ti, prepara tus apuntes de cada página y resuelve los exámenes.
 
+> ⚠️ **En desarrollo.** Algunas funciones pueden fallar o no funcionar como se espera.
+
 ## Qué hace
 
 - **Recorrer el curso y guardar apuntes:** avanza página por página y guarda un archivo `.md` por cada una en `Descargas/ccna/`. Opcionalmente antepone un resumen hecho con IA.
