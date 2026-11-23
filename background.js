@@ -17,6 +17,7 @@ const DEFAULTS = {
   apiKey: "",
   provider: "auto",
   useAI: false,
+  humanDelay: true,
   aiModel: "",
 };
 const PT_RE = /packet\s*tracer/i;
@@ -28,6 +29,32 @@ let running = false;
 let cachedGeminiModels = null;
 let cachedVeniceModels = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Distribución no uniforme (campana sesgada + jitter) entre 30s y 90s por pregunta
+function humanQuestionDelayMs(minSec = 30, maxSec = 90) {
+  const u = (Math.random() + Math.random() + Math.random()) / 3;
+  const skewed = Math.pow(u, 1.35);
+  const jitter = (Math.random() - 0.5) * 4000;
+  const ms = Math.round((minSec + skewed * (maxSec - minSec)) * 1000 + jitter);
+  return Math.max(minSec * 1000, Math.min(maxSec * 1000, ms));
+}
+
+async function humanWait(labelPrefix) {
+  const totalMs = humanQuestionDelayMs(30, 90);
+  const endAt = Date.now() + totalMs;
+  let lastSec = -1;
+  while (!abort) {
+    const remMs = endAt - Date.now();
+    if (remMs <= 0) break;
+    const remSec = Math.ceil(remMs / 1000);
+    if (remSec !== lastSec) {
+      lastSec = remSec;
+      await setState({ label: `${labelPrefix} · espera ${remSec}s` });
+    }
+    await sleep(Math.min(500, remMs));
+  }
+  return Math.round(totalMs / 1000);
+}
 
 async function getCfg() {
   const o = await chrome.storage.local.get(CFG);
@@ -1234,6 +1261,29 @@ function ccnaScan(learnedPatterns = []) {
             .map((o) => norm(o.text));
           return { el: sel, i, text: `${rowText} [${choices.join(" | ")}]` };
         }
+        if (sel.tagName === "MATCHING-DROPDOWN-VIEW") {
+          const titleEl = within(".matching__item-title", sel)[0];
+          const rowText =
+            norm(noIcons(deepText(titleEl || sel, SR))) ||
+            `Desplegable ${i + 1}`;
+          const seenC = new Set();
+          const choices = within('li[role="option"]', sel)
+            .map((li) => {
+              const inner = within(".dropdown__item-inner", li)[0] || li;
+              return norm(
+                inner.getAttribute?.("value") ||
+                  noIcons(deepText(inner, ".sr-only")),
+              );
+            })
+            .filter(
+              (t) =>
+                t &&
+                !/seleccion|select|elige|choose/i.test(t) &&
+                !seenC.has(t.toLowerCase()) &&
+                seenC.add(t.toLowerCase()),
+            );
+          return { el: sel, i, text: `${rowText} [${choices.join(" | ")}]` };
+        }
         return { el: sel, i, text: norm(noIcons(labelOf(sel))) };
       });
     } else if (type === "objectMatching") {
@@ -1546,7 +1596,24 @@ function ccnaScan(learnedPatterns = []) {
       add(grp, "checkbox", cEls, "", "", '[role="checkbox"], [role="option"]');
   }
 
-  // 5. Desplegables (<select>)
+  // 5. Desplegables (<select> y <matching-dropdown-view>)
+  const matchComps = deepAll(
+    '.matching__inner, [class*="matching__widget"]',
+  ).filter((w) => !chromeZone(w) && !isHiddenSlide(w, true));
+  const seenMatchComps = new Set();
+  for (const w of matchComps) {
+    const compBox = w.closest?.(".matching__inner, .is-question") || w;
+    if (seenMatchComps.has(compBox)) continue;
+    seenMatchComps.add(compBox);
+    const dds = within("matching-dropdown-view", compBox).filter(
+      (dd) => !isCtrlDisabled(dd) && !isHiddenSlide(dd, true),
+    );
+    if (dds.length >= 2) {
+      const stemEl = within('[class*="matching__body-inner"]', compBox)[0];
+      const stem = stemEl ? norm(noIcons(deepText(stemEl, SR))) : "";
+      add(compBox, "match", dds, stem, "", "matching-dropdown-view");
+    }
+  }
   const sels = deepAll("select").filter(
     (el) => !isCtrlDisabled(el) && !chromeZone(el) && !isHiddenSlide(el, true),
   );
@@ -1769,7 +1836,7 @@ function ccnaScan(learnedPatterns = []) {
       onConfirmScreen ||
       !!submitBtn ||
       !!deepAll(
-        '[class*="mcq__body-inner"], objectmatching-view, [class*="objectMatching__widget"]',
+        '[class*="mcq__body-inner"], objectmatching-view, [class*="objectMatching__widget"], matching-dropdown-view, [class*="matching__widget"]',
       ).length,
     hasStart: !!start,
     hasSubmit: !!submitBtn,
@@ -2116,6 +2183,83 @@ async function ccnaAnswerAndSubmit(
     return {
       ok: false,
       motivo: "no se pudieron emparejar las opciones en objectMatching",
+    };
+  }
+
+  // Caso desplegables personalizados (<matching-dropdown-view>)
+  const matchDds = within("matching-dropdown-view", root).filter(
+    (dd) => !isHiddenSlide(dd, true),
+  );
+  if (
+    matchDds.length > 0 &&
+    Array.isArray(opts) &&
+    typeof opts[0] === "string"
+  ) {
+    let okDd = 0;
+    for (let i = 0; i < matchDds.length && i < opts.length; i++) {
+      const dd = matchDds[i];
+      const targetTxt = norm(opts[i]).toLowerCase();
+      if (!targetTxt) continue;
+      dd.scrollIntoView?.({ behavior: "instant", block: "center" });
+      const btn = within("button.dropdown__btn", dd)[0];
+      if (!btn) continue;
+      singleClick(btn);
+      await sleep(90);
+      const liList = within('li[role="option"]', dd);
+      const optVal = (li) => {
+        const inner = within(".dropdown__item-inner", li)[0] || li;
+        return norm(
+          inner.getAttribute?.("value") ||
+            deepText(inner, ".sr-only"),
+        ).toLowerCase();
+      };
+      const hit =
+        liList.find((li) => optVal(li) === targetTxt) ||
+        liList.find(
+          (li) =>
+            optVal(li).includes(targetTxt) || targetTxt.includes(optVal(li)),
+        );
+      if (hit) {
+        const clickTarget = within(".dropdown__item-inner", hit)[0] || hit;
+        singleClick(clickTarget);
+        await sleep(90);
+        okDd++;
+      } else {
+        // cerrar desplegable si no hubo coincidencia
+        singleClick(btn);
+        await sleep(50);
+      }
+    }
+    if (okDd > 0) {
+      if (allowLocalSubmit) {
+        let subBtn = null;
+        for (let i = 0; i < 30 && !subBtn; i++) {
+          subBtn = findQuestionSubmit(root);
+          if (!subBtn) await sleep(30);
+        }
+        if (subBtn) {
+          singleClick(subBtn);
+          await sleep(100);
+          return {
+            ok: true,
+            marcadas: okDd,
+            submitted: true,
+            advanced: true,
+            motivo: "",
+          };
+        }
+      }
+      return {
+        ok: true,
+        marcadas: okDd,
+        submitted: false,
+        advanced: false,
+        motivo: "",
+      };
+    }
+    return {
+      ok: false,
+      motivo: "no se pudieron seleccionar las opciones en matching-dropdown-view",
     };
   }
 
@@ -3148,7 +3292,31 @@ function verifiedPick(q, verified) {
     }
   }
 
+  if (!v && q.type === "match") {
+    const rowNames = q.options.map((o) =>
+      nrm(o.text.replace(/\s*\[[^\]]*\]$/, "")),
+    );
+    for (const entries of Object.values(verified)) {
+      for (const e of entries || []) {
+        if (!e.matchMap || typeof e.matchMap !== "object") continue;
+        if (rowNames.length && rowNames.every((rn) => e.matchMap[rn])) {
+          v = e;
+          break;
+        }
+      }
+      if (v) break;
+    }
+  }
+
   if (!v) return null;
+  if (q.type === "match" && v.matchMap) {
+    const answers = q.options.map(
+      (o) => v.matchMap[nrm(o.text.replace(/\s*\[[^\]]*\]$/, ""))] || "",
+    );
+    return answers.length && answers.every(Boolean)
+      ? { idx: answers, correct: answers }
+      : null;
+  }
   if (q.type === "objectMatching") {
     return Array.isArray(v.pairs) && v.pairs.length
       ? {
@@ -3844,6 +4012,12 @@ async function runQuizzes(single = false) {
               continue;
             }
 
+            if (cfg.humanDelay !== false) {
+              const waited = await humanWait(etiqueta);
+              if (abort) break;
+              await log(`  ${etiqueta.toLowerCase()}: pausa humana (${waited}s)`);
+            }
+
             const resSub = await execIn(tab.id, frameId, ccnaAnswerAndSubmit, [
               q.id,
               picks,
@@ -4489,6 +4663,104 @@ function ccnaReviewHarvest() {
       out.push({ type: "objectMatching", pregunta, opciones, pairs });
     }
   }
+
+  // Componentes matching con desplegables personalizados (<matching-dropdown-view>)
+  const matchComps = deepAll('.matching__inner, [class*="matching__widget"]');
+  const seenMatch = new Set();
+  for (const w of matchComps) {
+    const compBox = w.closest?.(".matching__inner, .is-question") || w;
+    if (seenMatch.has(compBox)) continue;
+    seenMatch.add(compBox);
+    const dds = within("matching-dropdown-view", compBox);
+    if (dds.length < 2) continue;
+
+    const stemEl = within('[class*="matching__body-inner"]', compBox)[0];
+    const pregunta = stemEl ? norm(deepText(stemEl, SR)) : "";
+    const rows = dds.map((dd, i) => {
+      const titleEl = within(".matching__item-title", dd)[0];
+      const rowText =
+        norm(deepText(titleEl || dd, SR)) || `Desplegable ${i + 1}`;
+      const seenC = new Set();
+      const choices = within('li[role="option"]', dd)
+        .map((li) => {
+          const inner = within(".dropdown__item-inner", li)[0] || li;
+          return norm(
+            inner.getAttribute?.("value") || deepText(inner, ".sr-only"),
+          );
+        })
+        .filter(
+          (t) =>
+            t &&
+            !/seleccion|select|elige|choose/i.test(t) &&
+            !seenC.has(t.toLowerCase()) &&
+            seenC.add(t.toLowerCase()),
+        );
+      return { dd, rowText, choices, optText: `${rowText} [${choices.join(" | ")}]` };
+    });
+
+    const matchMap = {};
+    const allChoices = [...new Set(rows.flatMap((r) => r.choices))];
+    // 1) Tabla de retroalimentación (si existe en la vista de revisión)
+    const fbRoots = [];
+    for (
+      let cur = compBox, d = 0;
+      cur && d < 6;
+      cur = up(cur), d++
+    ) {
+      const fbs = within(
+        '[class*="feedback-content"], [class*="table-feedback"], [class*="feedback__body"]',
+        cur,
+      );
+      if (fbs.length) {
+        fbRoots.push(...fbs);
+        break;
+      }
+    }
+    const tables = fbRoots.flatMap((r) => within("table", r));
+    for (const tbl of tables) {
+      for (const tr of within("tr", tbl)) {
+        const cells = [...tr.children]
+          .filter((el) => el.tagName === "TD" || el.tagName === "TH")
+          .map((td) => norm(deepText(td, SR)));
+        if (cells.length < 2) continue;
+        const c0 = cells[0].toLowerCase();
+        const c1 = cells[1].toLowerCase();
+        const rowHit = rows.find(
+          (r) =>
+            r.rowText.toLowerCase() === c0 ||
+            c0.includes(r.rowText.toLowerCase()),
+        );
+        const choiceHit = allChoices.find(
+          (ch) => ch.toLowerCase() === c1 || c1.includes(ch.toLowerCase()),
+        );
+        if (rowHit && choiceHit) {
+          matchMap[rowHit.rowText.toLowerCase()] = choiceHit;
+        }
+      }
+    }
+
+    // 2) Fallback: si la revisión muestra las respuestas correctas dentro de cada desplegable
+    if (Object.keys(matchMap).length < rows.length) {
+      for (const r of rows) {
+        if (matchMap[r.rowText.toLowerCase()]) continue;
+        const btn = within("button.dropdown__btn", r.dd)[0];
+        const btnTxt = norm(deepText(btn, SR)).toLowerCase();
+        const selCorrect =
+          within('.is-correct, [class*="correct"]', r.dd).length > 0;
+        const ch = r.choices.find((c) => c.toLowerCase() === btnTxt);
+        if (ch && selCorrect) matchMap[r.rowText.toLowerCase()] = ch;
+      }
+    }
+
+    if (pregunta && rows.length >= 2) {
+      out.push({
+        type: "match",
+        pregunta,
+        opciones: rows.map((r) => ({ texto: r.optText })),
+        matchMap,
+      });
+    }
+  }
   return out;
 }
 
@@ -4535,7 +4807,9 @@ async function harvestReview(tabId) {
   const isComplete = (q) =>
     q.type === "objectMatching"
       ? (q.pairs?.length || 0) >= 2
-      : q.opciones.some((o) => o.estado);
+      : q.type === "match"
+        ? Object.keys(q.matchMap || {}).length >= 2
+        : q.opciones.some((o) => o.estado);
   const pushUniq = (arr) => {
     let completeAdded = 0;
     for (const q of arr || []) {
@@ -4606,6 +4880,18 @@ async function harvestReview(tabId) {
   for (const q of leidas) {
     const sig = optsSigOf(q.opciones.map((x) => x.texto));
     const text = nrm(q.pregunta);
+    if (q.type === "match") {
+      if (Object.keys(q.matchMap || {}).length >= 2) {
+        verified[sig] = [
+          ...(verified[sig] || []).filter((e) => e.text !== text),
+          { text, matchMap: q.matchMap },
+        ];
+        buenas++;
+      } else {
+        malas++;
+      }
+      continue;
+    }
     if (q.type === "objectMatching") {
       if (q.pairs?.length >= 2) {
         verified[sig] = [
