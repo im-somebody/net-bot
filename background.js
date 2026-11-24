@@ -4814,13 +4814,13 @@ function ccnaReviewHarvest() {
       '[class*="matching__body-inner"], [class*="objectMatching__body-inner"]',
       compBox,
     )[0];
-    const pregunta = stemEl ? norm(deepText(stemEl, SR)) : "";
+    const pregunta = stemEl ? norm(deepText(stemEl, SKIP)) : "";
     const rows = dds.map((dd, i) => {
       const titleEl =
         within(".matching__item-title_inner", dd)[0] ||
         within(".matching__item-title", dd)[0];
       const rowText =
-        norm(deepText(titleEl || dd, SR)) || `Desplegable ${i + 1}`;
+        norm(deepText(titleEl || dd, SKIP)) || `Desplegable ${i + 1}`;
       const seenC = new Set();
       const choices = within('li[role="option"]', dd)
         .map((li) => {
@@ -4865,7 +4865,7 @@ function ccnaReviewHarvest() {
       for (const tr of within("tr", tbl)) {
         const cells = [...tr.children]
           .filter((el) => el.tagName === "TD" || el.tagName === "TH")
-          .map((td) => norm(deepText(td, SR)));
+          .map((td) => norm(deepText(td, SKIP)));
         if (cells.length < 2) continue;
         const c0 = cells[0].toLowerCase();
         const c1 = cells[1].toLowerCase();
@@ -4900,7 +4900,7 @@ function ccnaReviewHarvest() {
       for (const r of rows) {
         if (matchMap[r.rowText.toLowerCase()]) continue;
         const btn = within("button.dropdown__btn", r.dd)[0];
-        const btnTxt = norm(deepText(btn, SR));
+        const btnTxt = norm(deepText(btn, SKIP));
         const selCorrect =
           within('.is-correct, [class*="correct"]', r.dd).length > 0;
         if (
@@ -5035,7 +5035,9 @@ async function harvestReview(tabId) {
       await execAll(tabId, ccnaCloseReview);
       await sleep(180);
     }
-  } catch {}
+  } catch (e) {
+    await log(`  revisión error: ${e.message}`);
+  }
   if (!leidas.length) {
     await log("  revisión: no se pudo leer");
     return false;
