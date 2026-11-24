@@ -3775,6 +3775,7 @@ async function runQuizzes(single = false) {
 
       const md = [];
       let sinVerificar = 0;
+      let omitidasCount = 0;
       const elegidas = [];
       const respondidas = new Set();
       const intentosPregunta = new Map();
@@ -3994,6 +3995,7 @@ async function runQuizzes(single = false) {
               if (skipped) {
                 respondidas.add(q.text);
                 enviadasCount++;
+                omitidasCount++;
                 huboEnvioEnLote = true;
                 await log(
                   `  ${etiqueta.toLowerCase()}: sin respuesta verificada, omitida`,
@@ -4126,7 +4128,7 @@ async function runQuizzes(single = false) {
           const v = verifiedPick(q, ver2);
           return v ? !igual(v.idx, idx) : false;
         }).length;
-        const omitidas = Math.max(0, sinVerificar - elegidas.length);
+        const omitidas = omitidasCount;
         if (rev && falladas)
           await log(
             `  ${falladas} respuestas de la IA no coinciden con NetAcad`,
