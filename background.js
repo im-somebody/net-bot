@@ -10,6 +10,7 @@ const PATTERNS_KEY = "ccna.patterns";
 const ANSWERS = "ccna.answers.v2";
 const VERIFIED = "ccna.verified";
 const WRONG = "ccna.wrong";
+const BLANK_DONE = "ccna.blankDone";
 
 const DEFAULTS = {
   maxPages: 1000,
@@ -3826,17 +3827,32 @@ async function runQuizzes(single = false) {
       visited++;
       let frameId = scan.frameId;
 
-      const ver = (await chrome.storage.local.get(VERIFIED))[VERIFIED] || {};
+      const stored = await chrome.storage.local.get([VERIFIED, BLANK_DONE]);
+      const ver = stored[VERIFIED] || {};
+      const blankDone = stored[BLANK_DONE] || {};
       const visibles0 = scan.questions.filter((q) => q.visible);
       const isPaginatedExam = (scan.progress?.total || 0) > visibles0.length;
+      const isMidExam = (scan.progress?.cur || 1) > 1;
       const attemptNum = intentosQuiz.get(title) || 0;
+      const alreadyHarvested =
+        !!blankDone[title] && visibles0.every((q) => verifiedPick(q, ver));
       const shouldBlankPass =
+        !isMidExam &&
+        !alreadyHarvested &&
         attemptNum === 0 &&
         visibles0.length > 0 &&
         (isPaginatedExam || !visibles0.every((q) => verifiedPick(q, ver)));
 
+      if (isMidExam) {
+        await log(
+          `  reanudando desde pregunta ${scan.progress.cur} de ${scan.progress.total || "?"} (usando respuestas guardadas)`,
+        );
+      }
+
       if (shouldBlankPass) {
         if (await blankPass(tab.id, frameId)) {
+          blankDone[title] = Date.now();
+          await chrome.storage.local.set({ [BLANK_DONE]: blankDone });
           scan = { questions: [] };
           for (let i = 0; i < 30 && !scan.questions?.length && !abort; i++) {
             await sleep(200);
@@ -3858,7 +3874,7 @@ async function runQuizzes(single = false) {
       const respondidas = new Set();
       const intentosPregunta = new Map();
       const intentosChip = new Map();
-      let enviadasCount = 0;
+      let enviadasCount = isMidExam ? (scan.progress?.cur || 1) - 1 : 0;
       let totalEsperado = scan.progress?.total || 0;
       let enviado = false;
       let quizCompletado = false;
