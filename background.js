@@ -10,6 +10,7 @@ const PATTERNS_KEY = "ccna.patterns";
 const ANSWERS = "ccna.answers.v2";
 const VERIFIED = "ccna.verified";
 const WRONG = "ccna.wrong";
+const BLANK_DONE = "ccna.blankDone";
 
 const DEFAULTS = {
   maxPages: 1000,
@@ -17,6 +18,7 @@ const DEFAULTS = {
   apiKey: "",
   provider: "auto",
   useAI: false,
+  humanDelay: true,
   aiModel: "",
 };
 const PT_RE = /packet\s*tracer/i;
@@ -28,6 +30,69 @@ let running = false;
 let cachedGeminiModels = null;
 let cachedVeniceModels = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Distribución no uniforme (campana sesgada + jitter):
+// 15–50s para preguntas normales; hasta 90s solo si la pregunta es realmente larga o compleja
+function isLargeQuestion(q) {
+  if (!q) return false;
+  const optLen = (q.options || []).reduce(
+    (acc, o) => acc + String(o?.text || "").length,
+    0,
+  );
+  const totalLen = String(q.text || "").length + optLen;
+  const hasExhibit = (q.images || []).length > 0 || /\[Imagen:/i.test(q.text || "");
+  return (
+    totalLen >= 500 ||
+    q.type === "match" ||
+    q.type === "objectMatching" ||
+    (hasExhibit && totalLen >= 300)
+  );
+}
+
+function humanQuestionDelayMs(q) {
+  const large = isLargeQuestion(q);
+  const minSec = large ? 30 : 15;
+  const maxSec = large ? 90 : 50;
+  const u = (Math.random() + Math.random() + Math.random()) / 3;
+  const skewed = Math.pow(u, 1.35);
+  const jitter = (Math.random() - 0.5) * 3000;
+  const ms = Math.round((minSec + skewed * (maxSec - minSec)) * 1000 + jitter);
+  return Math.max(minSec * 1000, Math.min(maxSec * 1000, ms));
+}
+
+async function humanWait(labelPrefix, q) {
+  const totalMs = humanQuestionDelayMs(q);
+  const endAt = Date.now() + totalMs;
+  let lastSec = -1;
+  while (!abort) {
+    const remMs = endAt - Date.now();
+    if (remMs <= 0) break;
+    const remSec = Math.ceil(remMs / 1000);
+    if (remSec !== lastSec) {
+      lastSec = remSec;
+      await setState({ label: `${labelPrefix} · espera ${remSec}s` });
+    }
+    await sleep(Math.min(500, remMs));
+  }
+  return Math.round(totalMs / 1000);
+}
+
+// En modo humano, elige 0..floor(10%) fallos aleatorios (no uniforme) para quedar en 90–100%
+function pickHumanMissSlots(total) {
+  const maxMiss = Math.floor((total || 0) * 0.1);
+  const slots = new Set();
+  if (maxMiss <= 0 || Math.random() < 0.35) return slots;
+  const target = Math.max(
+    1,
+    Math.min(maxMiss, Math.ceil(Math.pow(Math.random(), 1.3) * maxMiss)),
+  );
+  const pool = Array.from({ length: total }, (_, i) => i + 1);
+  while (slots.size < target && pool.length) {
+    const k = Math.floor(Math.random() * pool.length);
+    slots.add(pool.splice(k, 1)[0]);
+  }
+  return slots;
+}
 
 async function getCfg() {
   const o = await chrome.storage.local.get(CFG);
@@ -139,7 +204,14 @@ function resolveProvider(cfg) {
 }
 
 async function activeTab() {
-  const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (t && /^chrome-extension:/.test(t.url || "")) {
+    // popup abierto como pestaña: usar la pestaña de NetAcad más reciente
+    const all = await chrome.tabs.query({ currentWindow: true });
+    t = all
+      .filter((x) => /netacad\.(com|net)/.test(x.url || ""))
+      .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+  }
   if (!t) throw new Error("No hay pestaña activa.");
   if (!/netacad\.(com|net)|cisco\.com/.test(t.url || ""))
     throw new Error("Abre la lección de NetAcad en esta pestaña.");
@@ -915,6 +987,24 @@ function ccnaProbe() {
 }
 
 function ccnaScan(learnedPatterns = []) {
+  // El frame contenedor de NetAcad (con el menú lateral) nunca contiene el quiz
+  if (document.querySelector('iframe[title="Course content"]')) {
+    return {
+      url: location.href,
+      questions: [],
+      progress: null,
+      onConfirmScreen: false,
+      isResultScreen: false,
+      unansweredChips: [],
+      hasQuiz: false,
+      hasStart: false,
+      hasSubmit: false,
+      submitEnabled: false,
+      hasConfirm: false,
+      signature: "",
+      descartes: [],
+    };
+  }
   const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
   const deepAll = (sel, root = document) => {
     const out = [...root.querySelectorAll(sel)];
@@ -1208,6 +1298,40 @@ function ccnaScan(learnedPatterns = []) {
             )
             .map((o) => norm(o.text));
           return { el: sel, i, text: `${rowText} [${choices.join(" | ")}]` };
+        }
+        if (
+          sel.tagName === "MATCHING-DROPDOWN-VIEW" ||
+          sel.tagName === "OBJECT-MATCHING-DROPDOWN-VIEW"
+        ) {
+          const titleEl =
+            within(".matching__item-title_inner", sel)[0] ||
+            within(".matching__item-title", sel)[0];
+          const rowText =
+            norm(noIcons(deepText(titleEl || sel, SR))) ||
+            `Desplegable ${i + 1}`;
+          const seenC = new Set();
+          const choices = within('li[role="option"]', sel)
+            .map((li) => {
+              const inner = within(".dropdown__item-inner", li)[0] || li;
+              return norm(
+                inner.getAttribute?.("value") ||
+                  noIcons(deepText(inner, ".sr-only")),
+              );
+            })
+            .filter(
+              (t) =>
+                t &&
+                !/seleccion|select|elige|choose/i.test(t) &&
+                !seenC.has(t.toLowerCase()) &&
+                seenC.add(t.toLowerCase()),
+            );
+          return {
+            el: sel,
+            i,
+            text: choices.length
+              ? `${rowText} [${choices.join(" | ")}]`
+              : rowText,
+          };
         }
         return { el: sel, i, text: norm(noIcons(labelOf(sel))) };
       });
@@ -1521,7 +1645,37 @@ function ccnaScan(learnedPatterns = []) {
       add(grp, "checkbox", cEls, "", "", '[role="checkbox"], [role="option"]');
   }
 
-  // 5. Desplegables (<select>)
+  // 5. Desplegables (<select>, <matching-dropdown-view> y <object-matching-dropdown-view>)
+  const matchComps = deepAll(
+    '.matching__inner, [class*="matching__widget"], .objectmatching__inner, [class*="objectMatching__widget"]',
+  ).filter((w) => !chromeZone(w) && !isHiddenSlide(w, true));
+  const seenMatchComps = new Set();
+  for (const w of matchComps) {
+    const compBox =
+      w.closest?.(".matching__inner, .objectmatching__inner, .is-question") ||
+      w;
+    if (seenMatchComps.has(compBox)) continue;
+    seenMatchComps.add(compBox);
+    const dds = within(
+      "matching-dropdown-view, object-matching-dropdown-view",
+      compBox,
+    ).filter((dd) => !isCtrlDisabled(dd) && !isHiddenSlide(dd, true));
+    if (dds.length >= 2) {
+      const stemEl = within(
+        '[class*="matching__body-inner"], [class*="objectMatching__body-inner"]',
+        compBox,
+      )[0];
+      const stem = stemEl ? norm(noIcons(deepText(stemEl, SR))) : "";
+      add(
+        compBox,
+        "match",
+        dds,
+        stem,
+        "",
+        "matching-dropdown-view, object-matching-dropdown-view",
+      );
+    }
+  }
   const sels = deepAll("select").filter(
     (el) => !isCtrlDisabled(el) && !chromeZone(el) && !isHiddenSlide(el, true),
   );
@@ -1625,7 +1779,7 @@ function ccnaScan(learnedPatterns = []) {
   };
 
   const allButtons = deepAll(
-    'button, a, [role="button"], input[type=submit], [class*="submit"]',
+    'button, a, [role="button"], input[type=submit], [class*="submit"], .start-button',
   ).filter((e) => !isCookie(e) && !isHiddenSlide(e, true));
 
   const enabledButtons = allButtons.filter((e) => {
@@ -1744,7 +1898,7 @@ function ccnaScan(learnedPatterns = []) {
       onConfirmScreen ||
       !!submitBtn ||
       !!deepAll(
-        '[class*="mcq__body-inner"], objectmatching-view, [class*="objectMatching__widget"]',
+        '[class*="mcq__body-inner"], objectmatching-view, [class*="objectMatching__widget"], matching-dropdown-view, object-matching-dropdown-view, [class*="matching__widget"]',
       ).length,
     hasStart: !!start,
     hasSubmit: !!submitBtn,
@@ -2091,6 +2245,84 @@ async function ccnaAnswerAndSubmit(
     return {
       ok: false,
       motivo: "no se pudieron emparejar las opciones en objectMatching",
+    };
+  }
+
+  // Caso desplegables personalizados (<matching-dropdown-view> / <object-matching-dropdown-view>)
+  const matchDds = within(
+    "matching-dropdown-view, object-matching-dropdown-view",
+    root,
+  ).filter((dd) => !isHiddenSlide(dd, true));
+  if (
+    matchDds.length > 0 &&
+    Array.isArray(opts) &&
+    typeof opts[0] === "string"
+  ) {
+    let okDd = 0;
+    for (let i = 0; i < matchDds.length && i < opts.length; i++) {
+      const dd = matchDds[i];
+      const targetTxt = norm(opts[i]).toLowerCase();
+      if (!targetTxt) continue;
+      dd.scrollIntoView?.({ behavior: "instant", block: "center" });
+      const btn = within("button.dropdown__btn", dd)[0];
+      if (!btn) continue;
+      singleClick(btn);
+      await sleep(120);
+      const liList = within('li[role="option"]', dd);
+      const optVal = (li) => {
+        const inner = within(".dropdown__item-inner", li)[0] || li;
+        return norm(
+          inner.getAttribute?.("value") ||
+            deepText(inner, ".sr-only"),
+        ).toLowerCase();
+      };
+      const hit =
+        liList.find((li) => optVal(li) === targetTxt) ||
+        liList.find(
+          (li) =>
+            optVal(li).includes(targetTxt) || targetTxt.includes(optVal(li)),
+        );
+      if (hit) {
+        const clickTarget = within(".dropdown__item-inner", hit)[0] || hit;
+        singleClick(clickTarget);
+        await sleep(90);
+        okDd++;
+      } else {
+        // cerrar desplegable si no hubo coincidencia
+        singleClick(btn);
+        await sleep(50);
+      }
+    }
+    if (okDd > 0) {
+      if (allowLocalSubmit) {
+        let subBtn = null;
+        for (let i = 0; i < 30 && !subBtn; i++) {
+          subBtn = findQuestionSubmit(root);
+          if (!subBtn) await sleep(30);
+        }
+        if (subBtn) {
+          singleClick(subBtn);
+          await sleep(100);
+          return {
+            ok: true,
+            marcadas: okDd,
+            submitted: true,
+            advanced: true,
+            motivo: "",
+          };
+        }
+      }
+      return {
+        ok: true,
+        marcadas: okDd,
+        submitted: false,
+        advanced: false,
+        motivo: "",
+      };
+    }
+    return {
+      ok: false,
+      motivo: "no se pudieron seleccionar las opciones en matching-dropdown-view",
     };
   }
 
@@ -2682,7 +2914,7 @@ function ccnaNav(kind, arg) {
       });
 
   if (kind === "start") {
-    const b = deepAll('button,a,[role="button"]')
+    const b = deepAll('button,a,[role="button"],.start-button')
       .filter(ok)
       .find((el) =>
         /comenzar|iniciar|\bstart\b/i.test(
@@ -2748,6 +2980,16 @@ function ccnaNav(kind, arg) {
     }
     return false;
   }
+  if (kind === "moduleNext") {
+    const b = document.querySelector(
+      'button[class*="moduleNavBtn"][class*="next"]',
+    );
+    if (b && ok(b)) {
+      b.click();
+      return true;
+    }
+    return false;
+  }
   if (kind === "next") {
     const b = deepAll('button,a,[role="button"]')
       .filter(ok)
@@ -2763,6 +3005,56 @@ function ccnaNav(kind, arg) {
     }
     return false;
   }
+  if (kind === "outlineNext") {
+    // Avanza por el esquema del curso (solo existe en el frame superior), en orden del DOM
+    const items = () => [...document.querySelectorAll('[role="treeitem"]')];
+    const isLeaf = (el) => /blockContainer/.test(el.className || "");
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    return (async () => {
+      // El esquema se vuelve a pintar tras enviar un quiz: se reintenta hasta hallar la página activa
+      let list = [];
+      let cur = -1;
+      const num = (arg || "").match(/^\d+(?:\.\d+)+/)?.[0];
+      for (let t = 0; t < 10 && cur === -1; t++) {
+        list = items();
+        // primero por número de página (más fiable), luego por la clase "active"
+        if (num)
+          cur = list.findIndex(
+            (el) =>
+              isLeaf(el) && new RegExp("^" + num.replace(/\./g, "\\.") + "(?![\\d.])").test(norm(el.innerText)),
+          );
+        if (cur === -1)
+          cur = list.findIndex(
+            (el) => isLeaf(el) && /active/.test(el.className || ""),
+          );
+        if (cur === -1) await wait(400);
+      }
+      if (cur === -1) return false;
+      for (let i = cur + 1; i < list.length; i++) {
+        const el = list[i];
+        if (isLeaf(el)) {
+          el.click();
+          return true;
+        }
+        if (el.getAttribute("aria-expanded") === "false") {
+          el.click();
+          await wait(800);
+          const after = items();
+          // los elementos nuevos se insertan después de este, así que su índice no cambia
+          const idx = after.includes(el) ? after.indexOf(el) : i;
+          const first = after[idx + 1];
+          if (first && isLeaf(first)) {
+            first.click();
+            return true;
+          }
+          // sin hojas visibles (p. ej. módulo recién abierto): seguir con los sub-encabezados
+          list = after;
+          i = idx;
+        }
+      }
+      return false;
+    })();
+  }
   if (kind === "sidebarNext") {
     const root = outlineRoot();
     if (!root) return false;
@@ -2776,7 +3068,8 @@ function ccnaNav(kind, arg) {
     const cur = links.findIndex(
       (el) =>
         el.matches('[aria-current="page"],[aria-selected="true"]') ||
-        /active|selected/i.test(el.className || ""),
+        (/blockContainer/.test(el.className || "") &&
+          /active/i.test(el.className || "")),
     );
     if (cur === -1 || !links[cur + 1]) return false;
     const target = links[cur + 1];
@@ -2937,12 +3230,26 @@ async function navIn(tabId, frameId, kind, arg) {
   const args = arg === undefined ? [kind] : [kind, arg];
   return (await execIn(tabId, frameId, ccnaNav, args)) === true;
 }
-async function advance(tabId, before) {
-  if (await nav(tabId, "next")) return true;
-  if (await nav(tabId, "sidebarNext")) return true;
-  if (await nav(tabId, "expandModule")) {
+async function advance(tabId, before, title = "") {
+  // 1) Flecha nativa de NetAcad ("Ir a <siguiente submódulo / examen>"): cruza módulos sin perderse
+  const modNext = await execIn(tabId, 0, ccnaNav, ["moduleNext"]);
+  if (modNext === true) {
+    await waitChange(tabId, before);
+    await sleep(700);
+    return true;
+  }
+  // 2) Botón genérico Siguiente/Next
+  if (await nav(tabId, "next")) {
+    await waitChange(tabId, before);
     await sleep(600);
-    if (await nav(tabId, "sidebarNext")) return true;
+    return true;
+  }
+  // 3) Avance hacia adelante en el esquema lateral (nunca retrocede al módulo 1)
+  const top = await execIn(tabId, 0, ccnaNav, ["outlineNext", title]);
+  if (top === true) {
+    await waitChange(tabId, before);
+    await sleep(700);
+    return true;
   }
   return waitChange(tabId, before);
 }
@@ -3048,7 +3355,45 @@ function verifiedPick(q, verified) {
     }
   }
 
+  if (!v && q.type === "match") {
+    const rowNames = q.options.map((o) =>
+      nrm(o.text.replace(/\s*\[[^\]]*\]$/, "")),
+    );
+    for (const entries of Object.values(verified)) {
+      for (const e of entries || []) {
+        if (e.matchMap && typeof e.matchMap === "object") {
+          if (rowNames.length && rowNames.every((rn) => e.matchMap[rn])) {
+            v = e;
+            break;
+          }
+        } else if (Array.isArray(e.pairs) && e.pairs.length) {
+          // Compatibilidad con objectMatching guardado en modo escritorio
+          const map = {};
+          for (const p of e.pairs) {
+            const c = nrm(p.category);
+            const o = nrm(p.option);
+            if (rowNames.includes(c)) map[c] = p.option;
+            else if (rowNames.includes(o)) map[o] = p.category;
+          }
+          if (rowNames.length && rowNames.every((rn) => map[rn])) {
+            v = { ...e, matchMap: map };
+            break;
+          }
+        }
+      }
+      if (v) break;
+    }
+  }
+
   if (!v) return null;
+  if (q.type === "match" && v.matchMap) {
+    const answers = q.options.map(
+      (o) => v.matchMap[nrm(o.text.replace(/\s*\[[^\]]*\]$/, ""))] || "",
+    );
+    return answers.length && answers.every(Boolean)
+      ? { idx: answers, correct: answers }
+      : null;
+  }
   if (q.type === "objectMatching") {
     return Array.isArray(v.pairs) && v.pairs.length
       ? {
@@ -3324,7 +3669,10 @@ async function runWalk() {
     await setState({ page: title, label: "Recorriendo" });
     await log(`· ${title}`);
 
-    if (PT_RE.test(title) || PT_RE.test(info.docTitles))
+    if (
+      PT_RE.test(title) ||
+      (PT_RE.test(info.docTitles) && !QUIZ_RE.test(title))
+    )
       await log("  Packet Tracer: saltado");
     else if (!saved.has(title)) {
       saved.add(title);
@@ -3350,7 +3698,7 @@ async function runWalk() {
       await chrome.storage.local.set({ [IDX]: index });
     } else await log("  ya guardada");
 
-    if (!(await advance(tab.id, info.sig))) {
+    if (!(await advance(tab.id, info.sig, title))) {
       stop("No se pudo avanzar.");
       return;
     }
@@ -3384,7 +3732,16 @@ async function finishConfirmation(tabId, frameId) {
   return { ok: true, puntaje: "" };
 }
 
-async function runQuizzes() {
+async function outlineStatus(tabId, title = "") {
+  const r = await execAll(
+    tabId,
+    (t) => window.__ccna?.outlineStatus?.(t) || null,
+    [title],
+  );
+  return r.map((x) => x.result).find(Boolean) || null;
+}
+
+async function runQuizzes(single = false) {
   const patterns = await getLearnedPatterns();
   await log(
     `versión: quizzes-envio-v67 (patrones aprendidos: ${patterns.length})`,
@@ -3395,6 +3752,7 @@ async function runQuizzes() {
   const answers = [];
   const hechos = new Set();
   const intentosQuiz = new Map();
+  const repetirTitulo = new Set(); // quizzes que reintentamos nosotros mismos
   let visited = 0;
 
   for (let n = 0; n < cfg.maxPages && !abort; n++) {
@@ -3418,15 +3776,26 @@ async function runQuizzes() {
     const title = info.title || `Página ${n + 1}`;
     await setState({ page: title });
 
-    const isPT = PT_RE.test(title) || PT_RE.test(info.docTitles);
+    const isPT =
+      PT_RE.test(title) && !QUIZ_RE.test(title) && !QUIZ_RE.test(info.docTitles);
     let scan = { questions: [], hasQuiz: false, frameId: null, signature: "" };
     let repetir = false;
+    let yaCompletado = false;
 
     if (isPT) {
       await log(`· ${title}: Packet Tracer, saltado`);
     } else {
       scan = await scanTab(tab.id);
-      if (scan.hasStart) {
+      const maybeQuiz =
+        QUIZ_RE.test(title) ||
+        QUIZ_RE.test(info.docTitles) ||
+        scan.hasQuiz ||
+        scan.hasStart;
+      if (maybeQuiz) {
+        const os = await outlineStatus(tab.id, title);
+        yaCompletado = os?.status === "completed";
+      }
+      if (scan.hasStart && (!yaCompletado || repetirTitulo.has(title))) {
         await setState({ label: "Comenzando" });
         await nav(tab.id, "start");
         for (let i = 0; i < 18 && !scan.questions.length && !abort; i++) {
@@ -3438,10 +3807,19 @@ async function runQuizzes() {
 
     const isQuiz =
       !isPT &&
-      (QUIZ_RE.test(title) || QUIZ_RE.test(info.docTitles) || scan.hasQuiz);
+      (QUIZ_RE.test(title) ||
+        QUIZ_RE.test(info.docTitles) ||
+        scan.hasQuiz ||
+        scan.hasStart);
     const quizKey = `${title}::${scan.signature || info.sig.slice(0, 120)}`;
 
-    if (isQuiz && hechos.has(quizKey)) {
+    if (isQuiz && yaCompletado && !repetirTitulo.has(title)) {
+      await log(`· ${title}: ya completado, omitido`);
+      if (single) {
+        stop("Este quiz ya está completado.");
+        return;
+      }
+    } else if (isQuiz && hechos.has(quizKey)) {
       await log(`· ${title}: ya hecho`);
     } else if (isQuiz && scan.frameId !== null) {
       await log(`· ${title}`);
@@ -3449,17 +3827,32 @@ async function runQuizzes() {
       visited++;
       let frameId = scan.frameId;
 
-      const ver = (await chrome.storage.local.get(VERIFIED))[VERIFIED] || {};
+      const stored = await chrome.storage.local.get([VERIFIED, BLANK_DONE]);
+      const ver = stored[VERIFIED] || {};
+      const blankDone = stored[BLANK_DONE] || {};
       const visibles0 = scan.questions.filter((q) => q.visible);
       const isPaginatedExam = (scan.progress?.total || 0) > visibles0.length;
+      const isMidExam = (scan.progress?.cur || 1) > 1;
       const attemptNum = intentosQuiz.get(title) || 0;
+      const alreadyHarvested =
+        !!blankDone[title] && visibles0.every((q) => verifiedPick(q, ver));
       const shouldBlankPass =
+        !isMidExam &&
+        !alreadyHarvested &&
         attemptNum === 0 &&
         visibles0.length > 0 &&
         (isPaginatedExam || !visibles0.every((q) => verifiedPick(q, ver)));
 
+      if (isMidExam) {
+        await log(
+          `  reanudando desde pregunta ${scan.progress.cur} de ${scan.progress.total || "?"} (usando respuestas guardadas)`,
+        );
+      }
+
       if (shouldBlankPass) {
         if (await blankPass(tab.id, frameId)) {
+          blankDone[title] = Date.now();
+          await chrome.storage.local.set({ [BLANK_DONE]: blankDone });
           scan = { questions: [] };
           for (let i = 0; i < 30 && !scan.questions?.length && !abort; i++) {
             await sleep(200);
@@ -3474,11 +3867,14 @@ async function runQuizzes() {
 
       const md = [];
       let sinVerificar = 0;
+      let omitidasCount = 0;
+      let humanMissSlots = null;
+      const intentionalMissTexts = new Set();
       const elegidas = [];
       const respondidas = new Set();
       const intentosPregunta = new Map();
       const intentosChip = new Map();
-      let enviadasCount = 0;
+      let enviadasCount = isMidExam ? (scan.progress?.cur || 1) - 1 : 0;
       let totalEsperado = scan.progress?.total || 0;
       let enviado = false;
       let quizCompletado = false;
@@ -3693,6 +4089,7 @@ async function runQuizzes() {
               if (skipped) {
                 respondidas.add(q.text);
                 enviadasCount++;
+                omitidasCount++;
                 huboEnvioEnLote = true;
                 await log(
                   `  ${etiqueta.toLowerCase()}: sin respuesta verificada, omitida`,
@@ -3711,15 +4108,47 @@ async function runQuizzes() {
               continue;
             }
 
+            if (cfg.humanDelay !== false) {
+              if (humanMissSlots === null && totalPreg >= 10) {
+                humanMissSlots = pickHumanMissSlots(totalPreg);
+              }
+              const waited = await humanWait(etiqueta, q);
+              if (abort) break;
+              await log(`  ${etiqueta.toLowerCase()}: pausa humana (${waited}s)`);
+            }
+
+            let finalPicks = picks;
+            if (
+              cfg.humanDelay !== false &&
+              humanMissSlots?.has(antesCur || enviadasCount + 1) &&
+              q.type === "radio" &&
+              Array.isArray(picks) &&
+              picks.length === 1 &&
+              (q.options?.length || 0) >= 2
+            ) {
+              const wrongOpts = q.options
+                .map((_, idxOpt) => idxOpt)
+                .filter((idxOpt) => idxOpt !== picks[0]);
+              if (wrongOpts.length) {
+                const chosenWrong =
+                  wrongOpts[Math.floor(Math.random() * wrongOpts.length)];
+                finalPicks = [chosenWrong];
+                intentionalMissTexts.add(q.text);
+                await log(
+                  `  ${etiqueta.toLowerCase()}: variación humana (objetivo 90–100%)`,
+                );
+              }
+            }
+
             const resSub = await execIn(tab.id, frameId, ccnaAnswerAndSubmit, [
               q.id,
-              picks,
+              finalPicks,
               singlePaginated,
               q.patternSig?.optionSel || "",
               rankAll(q),
             ]);
             if (resSub?.ok && (!singlePaginated || resSub.submitted)) {
-              elegidas.push({ q, idx: picks });
+              elegidas.push({ q, idx: finalPicks });
               respondidas.add(q.text);
               enviadasCount++;
               if (resSub.submitted) {
@@ -3816,21 +4245,26 @@ async function runQuizzes() {
           a.length === b.length &&
           [...a].sort().join() === [...b].sort().join();
         const falladas = elegidas.filter(({ q, idx }) => {
+          if (intentionalMissTexts.has(q.text)) return false;
           const v = verifiedPick(q, ver2);
           return v ? !igual(v.idx, idx) : false;
         }).length;
-        const omitidas = Math.max(0, sinVerificar - elegidas.length);
+        const omitidas = omitidasCount;
         if (rev && falladas)
           await log(
             `  ${falladas} respuestas de la IA no coinciden con NetAcad`,
           );
         const n = (intentosQuiz.get(title) || 0) + 1;
         intentosQuiz.set(title, n);
-        if ((rev?.malas > 0 || falladas > 0 || omitidas > 0) && n < 4) {
+        const malasReales = Math.max(
+          0,
+          (rev?.malas || 0) - intentionalMissTexts.size,
+        );
+        if ((malasReales > 0 || falladas > 0 || omitidas > 0) && n < 4) {
           let retried = false;
           for (let rTry = 0; rTry < 5 && !retried; rTry++) {
             const re = await execAll(tab.id, ccnaClickText, [
-              "^(reiniciar|restablecer|retry)$",
+              "^(reiniciar|restablecer|retry|reset)$",
               ".js-assessment-retry-btn",
             ]);
             if (re.some((f) => f.result)) {
@@ -3839,6 +4273,7 @@ async function runQuizzes() {
                 `  reintento ${n + 1} de 4: completando ${omitidas > 0 ? `${omitidas} omitidas` : "incorrectas"}`,
               );
               hechos.delete(quizKey);
+              repetirTitulo.add(title);
               repetir = true;
             } else {
               await sleep(220);
@@ -3874,7 +4309,18 @@ async function runQuizzes() {
       continue;
     }
 
-    let movido = await advance(tab.id, info.sig);
+    if (single) {
+      await guardarRespuestas(answers);
+      stop(
+        visited
+          ? "Quiz terminado."
+          : "No encontré un quiz en esta página.",
+        !visited,
+      );
+      return;
+    }
+
+    let movido = await advance(tab.id, info.sig, title);
     if (!movido) {
       await guardarRespuestas(answers);
       stop(
@@ -4037,7 +4483,9 @@ function ccnaReviewClick() {
       ),
     );
   if (!b) return false;
-  (b.shadowRoot?.querySelector("button") || b).click();
+  const target = b.shadowRoot?.querySelector("button") || b;
+  target.scrollIntoView?.({ behavior: "instant", block: "center" });
+  target.click();
   return true;
 }
 
@@ -4344,6 +4792,139 @@ function ccnaReviewHarvest() {
       out.push({ type: "objectMatching", pregunta, opciones, pairs });
     }
   }
+
+  // Componentes matching con desplegables personalizados (<matching-dropdown-view> / <object-matching-dropdown-view>)
+  const matchComps = deepAll(
+    '.matching__inner, [class*="matching__widget"], .objectmatching__inner, [class*="objectMatching__widget"]',
+  );
+  const seenMatch = new Set();
+  for (const w of matchComps) {
+    const compBox =
+      w.closest?.(".matching__inner, .objectmatching__inner, .is-question") ||
+      w;
+    if (seenMatch.has(compBox)) continue;
+    seenMatch.add(compBox);
+    const dds = within(
+      "matching-dropdown-view, object-matching-dropdown-view",
+      compBox,
+    );
+    if (dds.length < 2) continue;
+
+    const stemEl = within(
+      '[class*="matching__body-inner"], [class*="objectMatching__body-inner"]',
+      compBox,
+    )[0];
+    const pregunta = stemEl ? norm(text(stemEl)) : "";
+    const rows = dds.map((dd, i) => {
+      const titleEl =
+        within(".matching__item-title_inner", dd)[0] ||
+        within(".matching__item-title", dd)[0];
+      const rowText =
+        norm(text(titleEl || dd)) || `Desplegable ${i + 1}`;
+      const seenC = new Set();
+      const choices = within('li[role="option"]', dd)
+        .map((li) => {
+          const inner = within(".dropdown__item-inner", li)[0] || li;
+          return norm(
+            inner.getAttribute?.("value") || text(inner),
+          );
+        })
+        .filter(
+          (t) =>
+            t &&
+            !/seleccion|select|elige|choose/i.test(t) &&
+            !seenC.has(t.toLowerCase()) &&
+            seenC.add(t.toLowerCase()),
+        );
+      return {
+        dd,
+        rowText,
+        choices,
+        optText: choices.length
+          ? `${rowText} [${choices.join(" | ")}]`
+          : rowText,
+      };
+    });
+
+    const matchMap = {};
+    const allChoices = [...new Set(rows.flatMap((r) => r.choices))];
+    // 1) Tabla de retroalimentación (si existe en la vista de revisión)
+    const fbRoots = [];
+    for (let cur = compBox, d = 0; cur && d < 6; cur = up(cur), d++) {
+      const fbs = within(
+        '[class*="feedback-content"], [class*="table-feedback"], [class*="feedback__body"]',
+        cur,
+      );
+      if (fbs.length) {
+        fbRoots.push(...fbs);
+        break;
+      }
+    }
+    const tables = fbRoots.flatMap((r) => within("table", r));
+    for (const tbl of tables) {
+      for (const tr of within("tr", tbl)) {
+        const cells = [...tr.children]
+          .filter((el) => el.tagName === "TD" || el.tagName === "TH")
+          .map((td) => norm(text(td)));
+        if (cells.length < 2) continue;
+        const c0 = cells[0].toLowerCase();
+        const c1 = cells[1].toLowerCase();
+        const rowHit0 = rows.find(
+          (r) =>
+            r.rowText.toLowerCase() === c0 ||
+            c0.includes(r.rowText.toLowerCase()),
+        );
+        const rowHit1 = rows.find(
+          (r) =>
+            r.rowText.toLowerCase() === c1 ||
+            c1.includes(r.rowText.toLowerCase()),
+        );
+        if (rowHit0 && cells[1]) {
+          const ch =
+            allChoices.find(
+              (x) => x.toLowerCase() === c1 || c1.includes(x.toLowerCase()),
+            ) || cells[1];
+          matchMap[rowHit0.rowText.toLowerCase()] = ch;
+        } else if (rowHit1 && cells[0]) {
+          const ch =
+            allChoices.find(
+              (x) => x.toLowerCase() === c0 || c0.includes(x.toLowerCase()),
+            ) || cells[0];
+          matchMap[rowHit1.rowText.toLowerCase()] = ch;
+        }
+      }
+    }
+
+    // 2) Fallback: si la revisión muestra las respuestas correctas dentro de cada desplegable
+    if (Object.keys(matchMap).length < rows.length) {
+      for (const r of rows) {
+        if (matchMap[r.rowText.toLowerCase()]) continue;
+        const btn = within("button.dropdown__btn", r.dd)[0];
+        const btnTxt = norm(text(btn));
+        const selCorrect =
+          within('.is-correct, [class*="correct"]', r.dd).length > 0;
+        if (
+          btnTxt &&
+          !/seleccion|select|elige|choose/i.test(btnTxt) &&
+          selCorrect
+        ) {
+          const ch =
+            r.choices.find((c) => c.toLowerCase() === btnTxt.toLowerCase()) ||
+            btnTxt;
+          matchMap[r.rowText.toLowerCase()] = ch;
+        }
+      }
+    }
+
+    if (pregunta && rows.length >= 2) {
+      out.push({
+        type: "match",
+        pregunta,
+        opciones: rows.map((r) => ({ texto: r.optText })),
+        matchMap,
+      });
+    }
+  }
   return out;
 }
 
@@ -4371,7 +4952,7 @@ async function blankPass(tabId, frameId) {
   let restarted = false;
   for (let rTry = 0; rTry < 5 && !restarted; rTry++) {
     const re = await execAll(tabId, ccnaClickText, [
-      "^(reiniciar|restablecer|retry)$",
+      "^(reiniciar|restablecer|retry|reset)$",
       ".js-assessment-retry-btn",
     ]);
     if (re.some((f) => f.result)) restarted = true;
@@ -4390,7 +4971,9 @@ async function harvestReview(tabId) {
   const isComplete = (q) =>
     q.type === "objectMatching"
       ? (q.pairs?.length || 0) >= 2
-      : q.opciones.some((o) => o.estado);
+      : q.type === "match"
+        ? Object.keys(q.matchMap || {}).length >= 2
+        : q.opciones.some((o) => o.estado);
   const pushUniq = (arr) => {
     let completeAdded = 0;
     for (const q of arr || []) {
@@ -4409,8 +4992,12 @@ async function harvestReview(tabId) {
   };
   let hasReviewBtn = false;
   try {
-    const clic = await execAll(tabId, ccnaReviewClick);
-    hasReviewBtn = clic.some((f) => f.result);
+    // En exámenes largos (Checkpoint Exam) el botón "Review Assessment" tarda en renderizarse
+    for (let rTry = 0; rTry < 16 && !hasReviewBtn && !abort; rTry++) {
+      const clic = await execAll(tabId, ccnaReviewClick);
+      hasReviewBtn = clic.some((f) => f.result);
+      if (!hasReviewBtn) await sleep(250);
+    }
     const espera = hasReviewBtn ? 22 : 4;
     let btnCount = 0;
     let lastCount = -1;
@@ -4448,7 +5035,9 @@ async function harvestReview(tabId) {
       await execAll(tabId, ccnaCloseReview);
       await sleep(180);
     }
-  } catch {}
+  } catch (e) {
+    await log(`  revisión error: ${e.message}`);
+  }
   if (!leidas.length) {
     await log("  revisión: no se pudo leer");
     return false;
@@ -4461,6 +5050,18 @@ async function harvestReview(tabId) {
   for (const q of leidas) {
     const sig = optsSigOf(q.opciones.map((x) => x.texto));
     const text = nrm(q.pregunta);
+    if (q.type === "match") {
+      if (Object.keys(q.matchMap || {}).length >= 2) {
+        verified[sig] = [
+          ...(verified[sig] || []).filter((e) => e.text !== text),
+          { text, matchMap: q.matchMap },
+        ];
+        buenas++;
+      } else {
+        malas++;
+      }
+      continue;
+    }
     if (q.type === "objectMatching") {
       if (q.pairs?.length >= 2) {
         verified[sig] = [
@@ -4578,11 +5179,12 @@ chrome.runtime.onMessage.addListener((msg, _s, send) => {
   (async () => {
     try {
       const cfg = await getCfg();
-      if (!["notes", "diag", "quizzes"].includes(msg.mode) && !cfg.apiKey)
+      if (!["notes", "diag", "quizzes", "quizone"].includes(msg.mode) && !cfg.apiKey)
         throw new Error("Falta la API key.");
 
       if (msg.mode === "notes") await runWalk();
       else if (msg.mode === "quizzes") await runQuizzes();
+      else if (msg.mode === "quizone") await runQuizzes(true);
       else if (msg.mode === "explain") await runExplain();
       else if (msg.mode === "diag") {
         const tab = await activeTab();

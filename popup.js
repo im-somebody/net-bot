@@ -9,6 +9,7 @@ const els = {
   provider: $("#provider"),
   apiKey: $("#apiKey"),
   useAI: $("#useAI"),
+  humanDelay: $("#humanDelay"),
   dot: $("#dot"),
   stateText: $("#stateText"),
   pageText: $("#pageText"),
@@ -35,6 +36,7 @@ async function load() {
   els.provider.value = c.provider || "auto";
   els.apiKey.value = c.apiKey ?? "";
   els.useAI.checked = !!c.useAI;
+  els.humanDelay.checked = c.humanDelay !== false;
   if (c.theme) document.documentElement.dataset.theme = c.theme;
   showTest(t);
   render(s);
@@ -66,6 +68,7 @@ function render(s = {}) {
     els.provider,
     els.apiKey,
     els.useAI,
+    els.humanDelay,
   ])
     f.disabled = live;
 }
@@ -84,6 +87,9 @@ els.apiKey.addEventListener("change", () =>
 );
 els.useAI.addEventListener("change", () =>
   saveCfg({ useAI: els.useAI.checked }),
+);
+els.humanDelay.addEventListener("change", () =>
+  saveCfg({ humanDelay: els.humanDelay.checked }),
 );
 $("#eye").addEventListener("click", () => {
   els.apiKey.type = els.apiKey.type === "password" ? "text" : "password";
