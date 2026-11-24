@@ -76,6 +76,23 @@ async function humanWait(labelPrefix, q) {
   return Math.round(totalMs / 1000);
 }
 
+// En modo humano, elige 0..floor(10%) fallos aleatorios (no uniforme) para quedar en 90–100%
+function pickHumanMissSlots(total) {
+  const maxMiss = Math.floor((total || 0) * 0.1);
+  const slots = new Set();
+  if (maxMiss <= 0 || Math.random() < 0.35) return slots;
+  const target = Math.max(
+    1,
+    Math.min(maxMiss, Math.ceil(Math.pow(Math.random(), 1.3) * maxMiss)),
+  );
+  const pool = Array.from({ length: total }, (_, i) => i + 1);
+  while (slots.size < target && pool.length) {
+    const k = Math.floor(Math.random() * pool.length);
+    slots.add(pool.splice(k, 1)[0]);
+  }
+  return slots;
+}
+
 async function getCfg() {
   const o = await chrome.storage.local.get(CFG);
   return { ...DEFAULTS, ...(o[CFG] || {}) };
@@ -3796,6 +3813,8 @@ async function runQuizzes(single = false) {
       const md = [];
       let sinVerificar = 0;
       let omitidasCount = 0;
+      let humanMissSlots = null;
+      const intentionalMissTexts = new Set();
       const elegidas = [];
       const respondidas = new Set();
       const intentosPregunta = new Map();
@@ -4035,20 +4054,46 @@ async function runQuizzes(single = false) {
             }
 
             if (cfg.humanDelay !== false) {
+              if (humanMissSlots === null && totalPreg >= 10) {
+                humanMissSlots = pickHumanMissSlots(totalPreg);
+              }
               const waited = await humanWait(etiqueta, q);
               if (abort) break;
               await log(`  ${etiqueta.toLowerCase()}: pausa humana (${waited}s)`);
             }
 
+            let finalPicks = picks;
+            if (
+              cfg.humanDelay !== false &&
+              humanMissSlots?.has(antesCur || enviadasCount + 1) &&
+              q.type === "radio" &&
+              Array.isArray(picks) &&
+              picks.length === 1 &&
+              (q.options?.length || 0) >= 2
+            ) {
+              const wrongOpts = q.options
+                .map((_, idxOpt) => idxOpt)
+                .filter((idxOpt) => idxOpt !== picks[0]);
+              if (wrongOpts.length) {
+                const chosenWrong =
+                  wrongOpts[Math.floor(Math.random() * wrongOpts.length)];
+                finalPicks = [chosenWrong];
+                intentionalMissTexts.add(q.text);
+                await log(
+                  `  ${etiqueta.toLowerCase()}: variación humana (objetivo 90–100%)`,
+                );
+              }
+            }
+
             const resSub = await execIn(tab.id, frameId, ccnaAnswerAndSubmit, [
               q.id,
-              picks,
+              finalPicks,
               singlePaginated,
               q.patternSig?.optionSel || "",
               rankAll(q),
             ]);
             if (resSub?.ok && (!singlePaginated || resSub.submitted)) {
-              elegidas.push({ q, idx: picks });
+              elegidas.push({ q, idx: finalPicks });
               respondidas.add(q.text);
               enviadasCount++;
               if (resSub.submitted) {
@@ -4145,6 +4190,7 @@ async function runQuizzes(single = false) {
           a.length === b.length &&
           [...a].sort().join() === [...b].sort().join();
         const falladas = elegidas.filter(({ q, idx }) => {
+          if (intentionalMissTexts.has(q.text)) return false;
           const v = verifiedPick(q, ver2);
           return v ? !igual(v.idx, idx) : false;
         }).length;
@@ -4155,7 +4201,11 @@ async function runQuizzes(single = false) {
           );
         const n = (intentosQuiz.get(title) || 0) + 1;
         intentosQuiz.set(title, n);
-        if ((rev?.malas > 0 || falladas > 0 || omitidas > 0) && n < 4) {
+        const malasReales = Math.max(
+          0,
+          (rev?.malas || 0) - intentionalMissTexts.size,
+        );
+        if ((malasReales > 0 || falladas > 0 || omitidas > 0) && n < 4) {
           let retried = false;
           for (let rTry = 0; rTry < 5 && !retried; rTry++) {
             const re = await execAll(tab.id, ccnaClickText, [
