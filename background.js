@@ -30,17 +30,37 @@ let cachedGeminiModels = null;
 let cachedVeniceModels = null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Distribución no uniforme (campana sesgada + jitter) entre 30s y 90s por pregunta
-function humanQuestionDelayMs(minSec = 30, maxSec = 90) {
+// Distribución no uniforme (campana sesgada + jitter):
+// 15–50s para preguntas normales; hasta 90s solo si la pregunta es realmente larga o compleja
+function isLargeQuestion(q) {
+  if (!q) return false;
+  const optLen = (q.options || []).reduce(
+    (acc, o) => acc + String(o?.text || "").length,
+    0,
+  );
+  const totalLen = String(q.text || "").length + optLen;
+  const hasExhibit = (q.images || []).length > 0 || /\[Imagen:/i.test(q.text || "");
+  return (
+    totalLen >= 500 ||
+    q.type === "match" ||
+    q.type === "objectMatching" ||
+    (hasExhibit && totalLen >= 300)
+  );
+}
+
+function humanQuestionDelayMs(q) {
+  const large = isLargeQuestion(q);
+  const minSec = large ? 30 : 15;
+  const maxSec = large ? 90 : 50;
   const u = (Math.random() + Math.random() + Math.random()) / 3;
   const skewed = Math.pow(u, 1.35);
-  const jitter = (Math.random() - 0.5) * 4000;
+  const jitter = (Math.random() - 0.5) * 3000;
   const ms = Math.round((minSec + skewed * (maxSec - minSec)) * 1000 + jitter);
   return Math.max(minSec * 1000, Math.min(maxSec * 1000, ms));
 }
 
-async function humanWait(labelPrefix) {
-  const totalMs = humanQuestionDelayMs(30, 90);
+async function humanWait(labelPrefix, q) {
+  const totalMs = humanQuestionDelayMs(q);
   const endAt = Date.now() + totalMs;
   let lastSec = -1;
   while (!abort) {
@@ -4015,7 +4035,7 @@ async function runQuizzes(single = false) {
             }
 
             if (cfg.humanDelay !== false) {
-              const waited = await humanWait(etiqueta);
+              const waited = await humanWait(etiqueta, q);
               if (abort) break;
               await log(`  ${etiqueta.toLowerCase()}: pausa humana (${waited}s)`);
             }
