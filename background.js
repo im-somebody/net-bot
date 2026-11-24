@@ -4137,7 +4137,7 @@ async function runQuizzes(single = false) {
           let retried = false;
           for (let rTry = 0; rTry < 5 && !retried; rTry++) {
             const re = await execAll(tab.id, ccnaClickText, [
-              "^(reiniciar|restablecer|retry)$",
+              "^(reiniciar|restablecer|retry|reset)$",
               ".js-assessment-retry-btn",
             ]);
             if (re.some((f) => f.result)) {
@@ -4356,7 +4356,9 @@ function ccnaReviewClick() {
       ),
     );
   if (!b) return false;
-  (b.shadowRoot?.querySelector("button") || b).click();
+  const target = b.shadowRoot?.querySelector("button") || b;
+  target.scrollIntoView?.({ behavior: "instant", block: "center" });
+  target.click();
   return true;
 }
 
@@ -4788,7 +4790,7 @@ async function blankPass(tabId, frameId) {
   let restarted = false;
   for (let rTry = 0; rTry < 5 && !restarted; rTry++) {
     const re = await execAll(tabId, ccnaClickText, [
-      "^(reiniciar|restablecer|retry)$",
+      "^(reiniciar|restablecer|retry|reset)$",
       ".js-assessment-retry-btn",
     ]);
     if (re.some((f) => f.result)) restarted = true;
@@ -4828,8 +4830,12 @@ async function harvestReview(tabId) {
   };
   let hasReviewBtn = false;
   try {
-    const clic = await execAll(tabId, ccnaReviewClick);
-    hasReviewBtn = clic.some((f) => f.result);
+    // En exámenes largos (Checkpoint Exam) el botón "Review Assessment" tarda en renderizarse
+    for (let rTry = 0; rTry < 16 && !hasReviewBtn && !abort; rTry++) {
+      const clic = await execAll(tabId, ccnaReviewClick);
+      hasReviewBtn = clic.some((f) => f.result);
+      if (!hasReviewBtn) await sleep(250);
+    }
     const espera = hasReviewBtn ? 22 : 4;
     let btnCount = 0;
     let lastCount = -1;
