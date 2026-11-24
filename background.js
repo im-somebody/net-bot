@@ -1298,8 +1298,13 @@ function ccnaScan(learnedPatterns = []) {
             .map((o) => norm(o.text));
           return { el: sel, i, text: `${rowText} [${choices.join(" | ")}]` };
         }
-        if (sel.tagName === "MATCHING-DROPDOWN-VIEW") {
-          const titleEl = within(".matching__item-title", sel)[0];
+        if (
+          sel.tagName === "MATCHING-DROPDOWN-VIEW" ||
+          sel.tagName === "OBJECT-MATCHING-DROPDOWN-VIEW"
+        ) {
+          const titleEl =
+            within(".matching__item-title_inner", sel)[0] ||
+            within(".matching__item-title", sel)[0];
           const rowText =
             norm(noIcons(deepText(titleEl || sel, SR))) ||
             `Desplegable ${i + 1}`;
@@ -1319,7 +1324,13 @@ function ccnaScan(learnedPatterns = []) {
                 !seenC.has(t.toLowerCase()) &&
                 seenC.add(t.toLowerCase()),
             );
-          return { el: sel, i, text: `${rowText} [${choices.join(" | ")}]` };
+          return {
+            el: sel,
+            i,
+            text: choices.length
+              ? `${rowText} [${choices.join(" | ")}]`
+              : rowText,
+          };
         }
         return { el: sel, i, text: norm(noIcons(labelOf(sel))) };
       });
@@ -1633,22 +1644,35 @@ function ccnaScan(learnedPatterns = []) {
       add(grp, "checkbox", cEls, "", "", '[role="checkbox"], [role="option"]');
   }
 
-  // 5. Desplegables (<select> y <matching-dropdown-view>)
+  // 5. Desplegables (<select>, <matching-dropdown-view> y <object-matching-dropdown-view>)
   const matchComps = deepAll(
-    '.matching__inner, [class*="matching__widget"]',
+    '.matching__inner, [class*="matching__widget"], .objectmatching__inner, [class*="objectMatching__widget"]',
   ).filter((w) => !chromeZone(w) && !isHiddenSlide(w, true));
   const seenMatchComps = new Set();
   for (const w of matchComps) {
-    const compBox = w.closest?.(".matching__inner, .is-question") || w;
+    const compBox =
+      w.closest?.(".matching__inner, .objectmatching__inner, .is-question") ||
+      w;
     if (seenMatchComps.has(compBox)) continue;
     seenMatchComps.add(compBox);
-    const dds = within("matching-dropdown-view", compBox).filter(
-      (dd) => !isCtrlDisabled(dd) && !isHiddenSlide(dd, true),
-    );
+    const dds = within(
+      "matching-dropdown-view, object-matching-dropdown-view",
+      compBox,
+    ).filter((dd) => !isCtrlDisabled(dd) && !isHiddenSlide(dd, true));
     if (dds.length >= 2) {
-      const stemEl = within('[class*="matching__body-inner"]', compBox)[0];
+      const stemEl = within(
+        '[class*="matching__body-inner"], [class*="objectMatching__body-inner"]',
+        compBox,
+      )[0];
       const stem = stemEl ? norm(noIcons(deepText(stemEl, SR))) : "";
-      add(compBox, "match", dds, stem, "", "matching-dropdown-view");
+      add(
+        compBox,
+        "match",
+        dds,
+        stem,
+        "",
+        "matching-dropdown-view, object-matching-dropdown-view",
+      );
     }
   }
   const sels = deepAll("select").filter(
@@ -1873,7 +1897,7 @@ function ccnaScan(learnedPatterns = []) {
       onConfirmScreen ||
       !!submitBtn ||
       !!deepAll(
-        '[class*="mcq__body-inner"], objectmatching-view, [class*="objectMatching__widget"], matching-dropdown-view, [class*="matching__widget"]',
+        '[class*="mcq__body-inner"], objectmatching-view, [class*="objectMatching__widget"], matching-dropdown-view, object-matching-dropdown-view, [class*="matching__widget"]',
       ).length,
     hasStart: !!start,
     hasSubmit: !!submitBtn,
@@ -2223,10 +2247,11 @@ async function ccnaAnswerAndSubmit(
     };
   }
 
-  // Caso desplegables personalizados (<matching-dropdown-view>)
-  const matchDds = within("matching-dropdown-view", root).filter(
-    (dd) => !isHiddenSlide(dd, true),
-  );
+  // Caso desplegables personalizados (<matching-dropdown-view> / <object-matching-dropdown-view>)
+  const matchDds = within(
+    "matching-dropdown-view, object-matching-dropdown-view",
+    root,
+  ).filter((dd) => !isHiddenSlide(dd, true));
   if (
     matchDds.length > 0 &&
     Array.isArray(opts) &&
@@ -2241,7 +2266,7 @@ async function ccnaAnswerAndSubmit(
       const btn = within("button.dropdown__btn", dd)[0];
       if (!btn) continue;
       singleClick(btn);
-      await sleep(90);
+      await sleep(120);
       const liList = within('li[role="option"]', dd);
       const optVal = (li) => {
         const inner = within(".dropdown__item-inner", li)[0] || li;
@@ -3335,10 +3360,24 @@ function verifiedPick(q, verified) {
     );
     for (const entries of Object.values(verified)) {
       for (const e of entries || []) {
-        if (!e.matchMap || typeof e.matchMap !== "object") continue;
-        if (rowNames.length && rowNames.every((rn) => e.matchMap[rn])) {
-          v = e;
-          break;
+        if (e.matchMap && typeof e.matchMap === "object") {
+          if (rowNames.length && rowNames.every((rn) => e.matchMap[rn])) {
+            v = e;
+            break;
+          }
+        } else if (Array.isArray(e.pairs) && e.pairs.length) {
+          // Compatibilidad con objectMatching guardado en modo escritorio
+          const map = {};
+          for (const p of e.pairs) {
+            const c = nrm(p.category);
+            const o = nrm(p.option);
+            if (rowNames.includes(c)) map[c] = p.option;
+            else if (rowNames.includes(o)) map[o] = p.category;
+          }
+          if (rowNames.length && rowNames.every((rn) => map[rn])) {
+            v = { ...e, matchMap: map };
+            break;
+          }
         }
       }
       if (v) break;
@@ -4738,20 +4777,32 @@ function ccnaReviewHarvest() {
     }
   }
 
-  // Componentes matching con desplegables personalizados (<matching-dropdown-view>)
-  const matchComps = deepAll('.matching__inner, [class*="matching__widget"]');
+  // Componentes matching con desplegables personalizados (<matching-dropdown-view> / <object-matching-dropdown-view>)
+  const matchComps = deepAll(
+    '.matching__inner, [class*="matching__widget"], .objectmatching__inner, [class*="objectMatching__widget"]',
+  );
   const seenMatch = new Set();
   for (const w of matchComps) {
-    const compBox = w.closest?.(".matching__inner, .is-question") || w;
+    const compBox =
+      w.closest?.(".matching__inner, .objectmatching__inner, .is-question") ||
+      w;
     if (seenMatch.has(compBox)) continue;
     seenMatch.add(compBox);
-    const dds = within("matching-dropdown-view", compBox);
+    const dds = within(
+      "matching-dropdown-view, object-matching-dropdown-view",
+      compBox,
+    );
     if (dds.length < 2) continue;
 
-    const stemEl = within('[class*="matching__body-inner"]', compBox)[0];
+    const stemEl = within(
+      '[class*="matching__body-inner"], [class*="objectMatching__body-inner"]',
+      compBox,
+    )[0];
     const pregunta = stemEl ? norm(deepText(stemEl, SR)) : "";
     const rows = dds.map((dd, i) => {
-      const titleEl = within(".matching__item-title", dd)[0];
+      const titleEl =
+        within(".matching__item-title_inner", dd)[0] ||
+        within(".matching__item-title", dd)[0];
       const rowText =
         norm(deepText(titleEl || dd, SR)) || `Desplegable ${i + 1}`;
       const seenC = new Set();
@@ -4769,18 +4820,21 @@ function ccnaReviewHarvest() {
             !seenC.has(t.toLowerCase()) &&
             seenC.add(t.toLowerCase()),
         );
-      return { dd, rowText, choices, optText: `${rowText} [${choices.join(" | ")}]` };
+      return {
+        dd,
+        rowText,
+        choices,
+        optText: choices.length
+          ? `${rowText} [${choices.join(" | ")}]`
+          : rowText,
+      };
     });
 
     const matchMap = {};
     const allChoices = [...new Set(rows.flatMap((r) => r.choices))];
     // 1) Tabla de retroalimentación (si existe en la vista de revisión)
     const fbRoots = [];
-    for (
-      let cur = compBox, d = 0;
-      cur && d < 6;
-      cur = up(cur), d++
-    ) {
+    for (let cur = compBox, d = 0; cur && d < 6; cur = up(cur), d++) {
       const fbs = within(
         '[class*="feedback-content"], [class*="table-feedback"], [class*="feedback__body"]',
         cur,
@@ -4799,16 +4853,28 @@ function ccnaReviewHarvest() {
         if (cells.length < 2) continue;
         const c0 = cells[0].toLowerCase();
         const c1 = cells[1].toLowerCase();
-        const rowHit = rows.find(
+        const rowHit0 = rows.find(
           (r) =>
             r.rowText.toLowerCase() === c0 ||
             c0.includes(r.rowText.toLowerCase()),
         );
-        const choiceHit = allChoices.find(
-          (ch) => ch.toLowerCase() === c1 || c1.includes(ch.toLowerCase()),
+        const rowHit1 = rows.find(
+          (r) =>
+            r.rowText.toLowerCase() === c1 ||
+            c1.includes(r.rowText.toLowerCase()),
         );
-        if (rowHit && choiceHit) {
-          matchMap[rowHit.rowText.toLowerCase()] = choiceHit;
+        if (rowHit0 && cells[1]) {
+          const ch =
+            allChoices.find(
+              (x) => x.toLowerCase() === c1 || c1.includes(x.toLowerCase()),
+            ) || cells[1];
+          matchMap[rowHit0.rowText.toLowerCase()] = ch;
+        } else if (rowHit1 && cells[0]) {
+          const ch =
+            allChoices.find(
+              (x) => x.toLowerCase() === c0 || c0.includes(x.toLowerCase()),
+            ) || cells[0];
+          matchMap[rowHit1.rowText.toLowerCase()] = ch;
         }
       }
     }
@@ -4818,11 +4884,19 @@ function ccnaReviewHarvest() {
       for (const r of rows) {
         if (matchMap[r.rowText.toLowerCase()]) continue;
         const btn = within("button.dropdown__btn", r.dd)[0];
-        const btnTxt = norm(deepText(btn, SR)).toLowerCase();
+        const btnTxt = norm(deepText(btn, SR));
         const selCorrect =
           within('.is-correct, [class*="correct"]', r.dd).length > 0;
-        const ch = r.choices.find((c) => c.toLowerCase() === btnTxt);
-        if (ch && selCorrect) matchMap[r.rowText.toLowerCase()] = ch;
+        if (
+          btnTxt &&
+          !/seleccion|select|elige|choose/i.test(btnTxt) &&
+          selCorrect
+        ) {
+          const ch =
+            r.choices.find((c) => c.toLowerCase() === btnTxt.toLowerCase()) ||
+            btnTxt;
+          matchMap[r.rowText.toLowerCase()] = ch;
+        }
       }
     }
 
